@@ -10,15 +10,17 @@ use chrono::{DateTime, TimeZone, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{Error, Execute, FromRow, Postgres, QueryBuilder, Row};
 use std::time::{Duration, Instant};
+use sqlx::Error::RowNotFound;
 
 use crate::hexrange::{hex_range, HexSearch};
 use crate::repo::postgres_migration::run_migrations;
 use crate::server::NostrMetrics;
-use crate::utils::{is_hex, is_lower_hex, unix_time};
+use crate::utils::{is_hex, is_lower_hex};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Receiver;
 use tracing::log::trace;
 use tracing::{debug, error, info};
+use crate::error;
 
 pub struct PostgresRepo {
     conn: PostgresPool,
@@ -333,17 +335,20 @@ ON CONFLICT (id) DO NOTHING"#,
     }
 
     async fn create_verification_record(&self, event_id: &str, name: &str) -> Result<()> {
-        // if we create a /new/ one, we should get rid of any old ones.  or group the new ones by name and only consider the latest.
-        sqlx::query(
-            r#"
-        DELETE FROM user_verification WHERE "name" = $2;
-        INSERT INTO user_verification (event_id, "name", verified_at) VALUES ($1, $2, now())"#,
-        )
+        let mut tx = self.conn.begin().await?;
+
+        sqlx::query("DELETE FROM user_verification WHERE \"name\" = $1")
+            .bind(name)
+            .execute(&mut tx)
+            .await?;
+
+        sqlx::query("INSERT INTO user_verification (event_id, \"name\", verified_at) VALUES ($1, $2, now())")
         .bind(hex::decode(event_id).ok())
         .bind(name)
-        .execute(&self.conn)
+        .execute(&mut tx)
         .await?;
 
+        tx.commit().await?;
         info!("saved new verification record for ({:?})", name);
         Ok(())
     }
@@ -354,7 +359,7 @@ ON CONFLICT (id) DO NOTHING"#,
 
         // update verification time and reset any failure count
         sqlx::query(
-            "UPDATE user_verification SET verified_at = $1, failure_count = 0 WHERE id = $2",
+            "UPDATE user_verification SET verified_at = $1, fail_count = 0 WHERE id = $2",
         )
         .bind(Utc.timestamp_opt(verify_time as i64, 0).unwrap())
         .bind(id as i64)
@@ -366,7 +371,7 @@ ON CONFLICT (id) DO NOTHING"#,
     }
 
     async fn fail_verification(&self, id: u64) -> Result<()> {
-        sqlx::query("UPDATE user_verification SET failed_at = now(), failure_count = failure_count + 1 WHERE id = $1")
+        sqlx::query("UPDATE user_verification SET failed_at = now(), fail_count = fail_count + 1 WHERE id = $1")
             .bind(id as i64)
             .execute(&self.conn)
             .await?;
@@ -385,45 +390,45 @@ ON CONFLICT (id) DO NOTHING"#,
         let query = r#"SELECT
             v.id,
             v."name",
-            e.id,
+            e.id as event_id,
             e.pub_key,
             e.created_at,
             v.verified_at,
             v.failed_at,
-            v.failure_count
+            v.fail_count
             FROM user_verification v
             LEFT JOIN "event" e ON e.id = v.event_id
             WHERE e.pub_key = $1
             ORDER BY e.created_at DESC, v.verified_at DESC, v.failed_at DESC
             LIMIT 1"#;
-        let res = sqlx::query_as::<_, VerificationRecord>(query)
+        sqlx::query_as::<_, VerificationRecord>(query)
             .bind(hex::decode(pub_key).ok())
-            .fetch_one(&self.conn)
-            .await?;
-        Ok(res)
+            .fetch_optional(&self.conn)
+            .await?
+            .ok_or(error::Error::SqlError(RowNotFound))
     }
 
     async fn get_oldest_user_verification(&self, before: u64) -> Result<VerificationRecord> {
         let query = r#"SELECT
             v.id,
             v."name",
-            e.id,
+            e.id as event_id,
             e.pub_key,
             e.created_at,
             v.verified_at,
             v.failed_at,
-            v.failure_count
+            v.fail_count
             FROM user_verification v
             LEFT JOIN "event" e ON e.id = v.event_id
                 WHERE (v.verified_at < $1 OR v.verified_at IS NULL)
                 AND (v.failed_at < $1 OR v.failed_at IS NULL)
             ORDER BY v.verified_at ASC, v.failed_at ASC
             LIMIT 1"#;
-        let res = sqlx::query_as::<_, VerificationRecord>(query)
+        sqlx::query_as::<_, VerificationRecord>(query)
             .bind(Utc.timestamp_opt(before as i64, 0).unwrap())
-            .fetch_one(&self.conn)
-            .await?;
-        Ok(res)
+            .fetch_optional(&self.conn)
+            .await?
+            .ok_or(error::Error::SqlError(RowNotFound))
     }
 }
 
@@ -649,19 +654,19 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
 impl FromRow<'_, PgRow> for VerificationRecord {
     fn from_row(row: &'_ PgRow) -> std::result::Result<Self, Error> {
         let name =
-            Nip05Name::try_from(row.get::<'_, &str, &str>("name")).or(Err(Error::RowNotFound))?;
+            Nip05Name::try_from(row.get::<'_, &str, &str>("name")).or(Err(RowNotFound))?;
         Ok(VerificationRecord {
             rowid: row.get::<'_, i64, &str>("id") as u64,
             name,
-            address: row.get("pub_key"),
-            event: row.get("event_id"),
+            address: hex::encode(row.get::<'_, Vec<u8>, &str>("pub_key")),
+            event: hex::encode(row.get::<'_, Vec<u8>, &str>("event_id")),
             event_created: row.get::<'_, DateTime<Utc>, &str>("created_at").timestamp() as u64,
             last_success: None,
             last_failure: match row.try_get::<'_, DateTime<Utc>, &str>("failed_at") {
                 Ok(x) => Some(x.timestamp() as u64),
                 _ => None,
             },
-            failure_count: row.get::<'_, i64, &str>("failure_count") as u64,
+            failure_count: row.get::<'_, i32, &str>("fail_count") as u64,
         })
     }
 }
