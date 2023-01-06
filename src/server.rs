@@ -339,7 +339,7 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
         };
 
         // create a connection pool
-        let repo = db::build_repo(&settings.database, metrics.clone()).await;
+        let repo = db::build_repo(&settings, metrics.clone()).await;
         if settings.database.in_memory {
             info!("using in-memory database, this will not persist a restart!");
         } else {

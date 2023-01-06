@@ -3,7 +3,7 @@ use crate::config::{Database, Settings};
 use crate::error::Result;
 use crate::event::Event;
 use crate::notice::Notice;
-use crate::repo::postgres::PostgresRepo;
+use crate::repo::postgres::{PostgresRepo, PostgresRepoSettings};
 use crate::repo::sqlite::SqliteRepo;
 use crate::repo::{NostrRepo, PostgresPool};
 use crate::server::NostrMetrics;
@@ -36,27 +36,29 @@ pub const EVENT_COUNT_OPTIMIZE_TRIGGER: usize = 500;
 /// # Panics
 ///
 /// Will panic if the pool could not be created.
-pub async fn build_repo(settings: &Database, metrics: NostrMetrics) -> Arc<dyn NostrRepo> {
-    match settings.engine.as_str() {
-        "sqlite" => Arc::new(build_sqlite_pool(settings, metrics).await),
+pub async fn build_repo(settings: &Settings, metrics: NostrMetrics) -> Arc<dyn NostrRepo> {
+    match settings.database.engine.as_str() {
+        "sqlite" => Arc::new(build_sqlite_pool(&settings.database, metrics).await),
         "postgres" => Arc::new(build_postgres_pool(settings, metrics).await),
         _ => panic!("Unknown database engine"),
     }
 }
 
-async fn build_postgres_pool(config: &Database, metrics: NostrMetrics) -> PostgresRepo {
-    let mut options: PgConnectOptions = config.connection.as_str().parse().unwrap();
+async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> PostgresRepo {
+    let mut options: PgConnectOptions = config.database.connection.as_str().parse().unwrap();
     options.log_statements(LevelFilter::Debug);
     options.log_slow_statements(LevelFilter::Warn, Duration::from_secs(60));
 
     let pool: PostgresPool = PoolOptions::new()
-        .max_connections(config.max_conn)
-        .min_connections(config.min_conn)
+        .max_connections(config.database.max_conn)
+        .min_connections(config.database.min_conn)
         .idle_timeout(Duration::from_secs(60))
         .connect_with(options)
         .await
         .unwrap();
-    PostgresRepo::new(pool, metrics)
+    PostgresRepo::new(pool, metrics, PostgresRepoSettings {
+        cleanup_contact_list: config.options.cleanup_contact_list
+    })
 }
 
 async fn build_sqlite_pool(config: &Database, metrics: NostrMetrics) -> SqliteRepo {

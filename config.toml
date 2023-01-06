@@ -66,6 +66,9 @@ port = 8080
 # from the current time, but the default is to allow any date.
 reject_future_seconds = 1800
 
+# Automatically delete old contact list events when newer lists are published
+cleanup_contact_list = true
+
 [limits]
 # Limit events created per second, averaged over one minute.  Must be
 # an integer.  If not set (or set to 0), defaults to unlimited.  Note:

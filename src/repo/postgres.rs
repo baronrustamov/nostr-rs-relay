@@ -25,13 +25,19 @@ use crate::error;
 pub struct PostgresRepo {
     conn: PostgresPool,
     metrics: NostrMetrics,
+    settings: PostgresRepoSettings
+}
+
+pub struct PostgresRepoSettings {
+    pub cleanup_contact_list: bool
 }
 
 impl PostgresRepo {
-    pub fn new(c: PostgresPool, m: NostrMetrics) -> PostgresRepo {
+    pub fn new(c: PostgresPool, m: NostrMetrics, s: PostgresRepoSettings) -> PostgresRepo {
         PostgresRepo {
             conn: c,
             metrics: m,
+            settings: s,
         }
     }
 }
@@ -61,15 +67,15 @@ impl NostrRepo for PostgresRepo {
 VALUES($1, $2, $3, $4, $5, $6)
 ON CONFLICT (id) DO NOTHING"#,
         )
-        .bind(&id_blob)
-        .bind(&pubkey_blob)
-        .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-        .bind(e.kind as i64)
-        .bind(event_str.into_bytes())
-        .bind(delegator_blob)
-        .execute(&mut tx)
-        .await?
-        .rows_affected();
+            .bind(&id_blob)
+            .bind(&pubkey_blob)
+            .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
+            .bind(e.kind as i64)
+            .bind(event_str.into_bytes())
+            .bind(delegator_blob)
+            .execute(&mut tx)
+            .await?
+            .rows_affected();
 
         if ins_count == 0 {
             // if the event was a duplicate, no need to insert event or
@@ -114,7 +120,13 @@ ON CONFLICT (id) DO NOTHING"#,
         // if this event is replaceable update, hide every other replaceable
         // event with the same kind from the same author that was issued
         // earlier than this.
-        if e.kind == 0 || e.kind == 3 || (e.kind >= 10000 && e.kind < 20000) {
+        if e.kind == 3 && self.settings.cleanup_contact_list {
+            sqlx::query("delete from \"event\" where id != $1 and kind = 3 and pub_key = $2")
+                .bind(&id_blob)
+                .bind(hex::decode(&e.pubkey).ok())
+                .execute(&mut tx)
+                .await?;
+        } else if e.kind == 0 || e.kind == 3 || (e.kind >= 10000 && e.kind < 20000) {
             let update_count = sqlx::query("UPDATE \"event\" SET hidden = 1::bit(1) \
             WHERE id != $1 AND kind = $2 AND pub_key = $3 AND created_at <= $4 and hidden != 1::bit(1)")
                 .bind(&id_blob)
@@ -169,10 +181,10 @@ ON CONFLICT (id) DO NOTHING"#,
             LEFT JOIN tag t ON e.id = t.event_id \
             WHERE e.pub_key = $1 AND t.\"name\" = 'e' AND e.kind = 5 AND t.value = $2 LIMIT 1",
             )
-            .bind(&pubkey_blob)
-            .bind(&id_blob)
-            .fetch_optional(&mut tx)
-            .await?;
+                .bind(&pubkey_blob)
+                .bind(&id_blob)
+                .fetch_optional(&mut tx)
+                .await?;
 
             // check if a the query returned a result, meaning we should
             // hid the current event
@@ -343,10 +355,10 @@ ON CONFLICT (id) DO NOTHING"#,
             .await?;
 
         sqlx::query("INSERT INTO user_verification (event_id, \"name\", verified_at) VALUES ($1, $2, now())")
-        .bind(hex::decode(event_id).ok())
-        .bind(name)
-        .execute(&mut tx)
-        .await?;
+            .bind(hex::decode(event_id).ok())
+            .bind(name)
+            .execute(&mut tx)
+            .await?;
 
         tx.commit().await?;
         info!("saved new verification record for ({:?})", name);
@@ -361,10 +373,10 @@ ON CONFLICT (id) DO NOTHING"#,
         sqlx::query(
             "UPDATE user_verification SET verified_at = $1, fail_count = 0 WHERE id = $2",
         )
-        .bind(Utc.timestamp_opt(verify_time as i64, 0).unwrap())
-        .bind(id as i64)
-        .execute(&self.conn)
-        .await?;
+            .bind(Utc.timestamp_opt(verify_time as i64, 0).unwrap())
+            .bind(id as i64)
+            .execute(&self.conn)
+            .await?;
 
         info!("verification updated for {}", id);
         Ok(())
