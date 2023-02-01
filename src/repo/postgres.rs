@@ -517,6 +517,8 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
                 }
             }
             query.push(")");
+        } else {
+            return None
         }
     }
 
@@ -534,6 +536,8 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
                 list_query.push_bind(*k as i64);
             }
             query.push(")");
+        } else {
+            return None
         }
     }
 
@@ -592,12 +596,14 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
             }
 
             query.push(")");
+        } else {
+            return None
         }
     }
 
     // Query for tags
     if let Some(map) = &f.tags {
-        if !map.is_empty() {
+        if !map.is_empty() && map.iter().all(|(_,v)| !v.is_empty()) {
             if push_and {
                 query.push(" AND ");
             }
@@ -619,6 +625,8 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
                 }
                 query.push("))))");
             }
+        } else {
+            return None
         }
     }
 
