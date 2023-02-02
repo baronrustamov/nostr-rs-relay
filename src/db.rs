@@ -56,7 +56,24 @@ async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> Postgr
         .connect_with(options)
         .await
         .unwrap();
-    PostgresRepo::new(pool, metrics, PostgresRepoSettings {
+
+    let write_pool : PostgresPool = match &config.database.connection_write {
+        Some(cfg_write) => {
+            let mut options_write: PgConnectOptions = cfg_write.as_str().parse().unwrap();
+            options_write.log_statements(LevelFilter::Debug);
+            options_write.log_slow_statements(LevelFilter::Warn, Duration::from_secs(60));
+
+            PoolOptions::new()
+                .max_connections(config.database.max_conn)
+                .min_connections(config.database.min_conn)
+                .idle_timeout(Duration::from_secs(60))
+                .connect_with(options_write)
+                .await
+                .unwrap()
+        },
+        None => pool.clone()
+    };
+    PostgresRepo::new(pool, write_pool, metrics, PostgresRepoSettings {
         cleanup_contact_list: config.options.cleanup_contact_list
     })
 }

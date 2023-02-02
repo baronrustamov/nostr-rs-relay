@@ -24,6 +24,7 @@ use crate::error;
 
 pub struct PostgresRepo {
     conn: PostgresPool,
+    conn_write: PostgresPool,
     metrics: NostrMetrics,
     settings: PostgresRepoSettings
 }
@@ -33,9 +34,10 @@ pub struct PostgresRepoSettings {
 }
 
 impl PostgresRepo {
-    pub fn new(c: PostgresPool, m: NostrMetrics, s: PostgresRepoSettings) -> PostgresRepo {
+    pub fn new(c: PostgresPool, cw: PostgresPool, m: NostrMetrics, s: PostgresRepoSettings) -> PostgresRepo {
         PostgresRepo {
             conn: c,
+            conn_write: cw,
             metrics: m,
             settings: s,
         }
@@ -50,7 +52,7 @@ impl NostrRepo for PostgresRepo {
 
     async fn write_event(&self, e: &Event) -> Result<u64> {
         // start transaction
-        let mut tx = self.conn.begin().await?;
+        let mut tx = self.conn_write.begin().await?;
         let start = Instant::now();
 
         // get relevant fields from event and convert to blobs.
@@ -347,7 +349,7 @@ ON CONFLICT (id) DO NOTHING"#,
     }
 
     async fn create_verification_record(&self, event_id: &str, name: &str) -> Result<()> {
-        let mut tx = self.conn.begin().await?;
+        let mut tx = self.conn_write.begin().await?;
 
         sqlx::query("DELETE FROM user_verification WHERE \"name\" = $1")
             .bind(name)
@@ -375,7 +377,7 @@ ON CONFLICT (id) DO NOTHING"#,
         )
             .bind(Utc.timestamp_opt(verify_time as i64, 0).unwrap())
             .bind(id as i64)
-            .execute(&self.conn)
+            .execute(&self.conn_write)
             .await?;
 
         info!("verification updated for {}", id);
@@ -385,7 +387,7 @@ ON CONFLICT (id) DO NOTHING"#,
     async fn fail_verification(&self, id: u64) -> Result<()> {
         sqlx::query("UPDATE user_verification SET failed_at = now(), fail_count = fail_count + 1 WHERE id = $1")
             .bind(id as i64)
-            .execute(&self.conn)
+            .execute(&self.conn_write)
             .await?;
         Ok(())
     }
@@ -393,7 +395,7 @@ ON CONFLICT (id) DO NOTHING"#,
     async fn delete_verification(&self, id: u64) -> Result<()> {
         sqlx::query("DELETE FROM user_verification WHERE id = $1")
             .bind(id as i64)
-            .execute(&self.conn)
+            .execute(&self.conn_write)
             .await?;
         Ok(())
     }
