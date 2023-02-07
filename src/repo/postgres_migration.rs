@@ -31,7 +31,7 @@ pub async fn run_migrations(db: &PostgresPool) -> crate::error::Result<usize> {
     prepare_migrations_table(db).await;
     run_migration(m001::migration(), db).await;
     let m002_result = run_migration(m002::migration(), db).await;
-    if m002_result == MigrationResult::Upgraded {
+    if m002_result == MigrationResult::Upgraded || m002_result == MigrationResult::NotNeeded {
         m002::rebuild_tags(db).await?;
     }
     run_migration(m003::migration(), db).await;
@@ -173,17 +173,15 @@ CREATE INDEX tag_value_hex_idx ON tag USING btree (value_hex);
     pub async fn rebuild_tags(db: &PostgresPool) -> crate::error::Result<()> {
         // Check how many events we have to process
         let start = Instant::now();
-        let mut tx = db.begin().await.unwrap();
-        let mut update_tx = db.begin().await.unwrap();
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) from event;")
+            .fetch_one(db)
+            .await
+            .unwrap();
         // Clear out table
         sqlx::query("DELETE FROM tag;")
-            .execute(&mut update_tx)
+            .execute(db)
             .await?;
         {
-            let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) from event;")
-                .fetch_one(&mut tx)
-                .await
-                .unwrap();
             let bar = ProgressBar::new(event_count.try_into().unwrap())
                 .with_message("rebuilding tags table");
             bar.set_style(
@@ -193,7 +191,7 @@ CREATE INDEX tag_value_hex_idx ON tag USING btree (value_hex);
                 .unwrap(),
             );
             let mut events =
-                sqlx::query("SELECT id, content FROM event ORDER BY id;").fetch(&mut tx);
+                sqlx::query("SELECT id, content FROM event ORDER BY id;").fetch(db);
             while let Some(row) = events.next().await {
                 bar.inc(1);
                 // get the row id and content
@@ -218,7 +216,7 @@ CREATE INDEX tag_value_hex_idx ON tag USING btree (value_hex);
                             .bind(&event_id)
                             .bind(tagname)
                             .bind(hex::decode(tagval).ok())
-                            .execute(&mut update_tx)
+                            .execute(db)
                             .await?;
                     } else {
                         let q = "INSERT INTO tag (event_id, \"name\", value) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;";
@@ -226,12 +224,11 @@ CREATE INDEX tag_value_hex_idx ON tag USING btree (value_hex);
                             .bind(&event_id)
                             .bind(tagname)
                             .bind(tagval.as_bytes())
-                            .execute(&mut update_tx)
+                            .execute(db)
                             .await?;
                     }
                 }
             }
-            update_tx.commit().await?;
             bar.finish();
         }
         info!("rebuilt tags in {:?}", start.elapsed());
