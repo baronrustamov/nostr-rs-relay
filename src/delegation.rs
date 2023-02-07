@@ -84,7 +84,7 @@ pub struct ConditionQuery {
 }
 
 impl ConditionQuery {
-    pub fn allows_event(&self, event: &Event) -> bool {
+    #[must_use] pub fn allows_event(&self, event: &Event) -> bool {
         // check each condition, to ensure that the event complies
         // with the restriction.
         for c in &self.conditions {
@@ -101,14 +101,14 @@ impl ConditionQuery {
 }
 
 // Verify that the delegator approved the delegation; return a ConditionQuery if so.
-pub fn validate_delegation(
+#[must_use] pub fn validate_delegation(
     delegator: &str,
     delegatee: &str,
     cond_query: &str,
     sigstr: &str,
 ) -> Option<ConditionQuery> {
     // form the token
-    let tok = format!("nostr:delegation:{}:{}", delegatee, cond_query);
+    let tok = format!("nostr:delegation:{delegatee}:{cond_query}");
     // form SHA256 hash
     let digest: sha256::Hash = sha256::Hash::hash(tok.as_bytes());
     let sig = schnorr::Signature::from_str(sigstr).unwrap();
@@ -133,8 +133,8 @@ pub fn validate_delegation(
 }
 
 /// Parsed delegation condition
-/// see https://github.com/nostr-protocol/nips/pull/28#pullrequestreview-1084903800
-/// An example complex condition would be:  kind=1,2,3&created_at<1665265999
+/// see <https://github.com/nostr-protocol/nips/pull/28#pullrequestreview-1084903800>
+/// An example complex condition would be:  `kind=1,2,3&created_at<1665265999`
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct Condition {
     pub field: Field,
@@ -144,7 +144,7 @@ pub struct Condition {
 
 impl Condition {
     /// Check if this condition allows the given event to be delegated
-    pub fn allows_event(&self, event: &Event) -> bool {
+    #[must_use] pub fn allows_event(&self, event: &Event) -> bool {
         // determine what the right-hand side of the operator is
         let resolved_field = match &self.field {
             Field::Kind => event.kind,
@@ -323,7 +323,7 @@ mod tests {
                 Condition {
                     field: Field::CreatedAt,
                     operator: Operator::LessThan,
-                    values: vec![1665867123],
+                    values: vec![1_665_867_123],
                 },
             ],
         };

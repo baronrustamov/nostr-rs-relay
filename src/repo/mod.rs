@@ -6,17 +6,16 @@ use crate::subscription::Subscription;
 use crate::utils::unix_time;
 use async_trait::async_trait;
 use rand::Rng;
-use sqlx::Postgres;
-
-pub(crate) mod postgres;
-mod postgres_migration;
-pub(crate) mod sqlite;
-mod sqlite_migration;
-
-pub type PostgresPool = sqlx::pool::Pool<Postgres>;
+pub mod sqlite;
+pub mod sqlite_migration;
+pub mod postgres;
+pub mod postgres_migration;
 
 #[async_trait]
 pub trait NostrRepo: Send + Sync {
+    /// Start the repository (any initialization or maintenance tasks can be kicked off here)
+    async fn start(&self) -> Result<()>;
+
     /// Run migrations and return current version
     async fn migrate_up(&self) -> Result<usize>;
 

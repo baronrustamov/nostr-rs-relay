@@ -2,7 +2,7 @@ use crate::db::QueryResult;
 use crate::error::Result;
 use crate::event::{single_char_tagname, Event};
 use crate::nip05::{Nip05Name, VerificationRecord};
-use crate::repo::{now_jitter, NostrRepo, PostgresPool};
+use crate::repo::{now_jitter, NostrRepo};
 use crate::subscription::{ReqFilter, Subscription};
 use async_std::stream::StreamExt;
 use async_trait::async_trait;
@@ -22,32 +22,34 @@ use tracing::log::trace;
 use tracing::{debug, error, info};
 use crate::error;
 
+pub type PostgresPool = sqlx::pool::Pool<Postgres>;
+
 pub struct PostgresRepo {
     conn: PostgresPool,
     conn_write: PostgresPool,
     metrics: NostrMetrics,
-    settings: PostgresRepoSettings
-}
-
-pub struct PostgresRepoSettings {
-    pub cleanup_contact_list: bool
 }
 
 impl PostgresRepo {
-    pub fn new(c: PostgresPool, cw: PostgresPool, m: NostrMetrics, s: PostgresRepoSettings) -> PostgresRepo {
+    pub fn new(c: PostgresPool, cw: PostgresPool, m: NostrMetrics) -> PostgresRepo {
         PostgresRepo {
             conn: c,
             conn_write: cw,
             metrics: m,
-            settings: s,
         }
     }
 }
 
 #[async_trait]
 impl NostrRepo for PostgresRepo {
+
+    async fn start(&self) -> Result<()> {
+        info!("not implemented");
+        Ok(())
+    }
+
     async fn migrate_up(&self) -> Result<usize> {
-        run_migrations(&self.conn_write).await
+        Ok(run_migrations(&self.conn_write).await?)
     }
 
     async fn write_event(&self, e: &Event) -> Result<u64> {
@@ -62,6 +64,47 @@ impl NostrRepo for PostgresRepo {
             e.delegated_by.as_ref().and_then(|d| hex::decode(d).ok());
         let event_str = serde_json::to_string(&e).unwrap();
 
+        // determine if this event would be shadowed by an existing
+        // replaceable event or parameterized replaceable event.
+        if e.is_replaceable() {
+            let repl_count = sqlx::query(
+                "SELECT e.id FROM event e WHERE e.pub_key=? AND e.kind=? AND e.created_at >= ? LIMIT 1;")
+                .bind(&pubkey_blob)
+                .bind(e.kind as i64)
+                .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
+                .fetch_optional(&mut tx)
+                .await?;
+            if repl_count.is_some() {
+                return Ok(0);
+            }
+        }
+        if let Some(d_tag) = e.distinct_param() {
+            let repl_count:i64 = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
+                sqlx::query_scalar(
+                    "SELECT count(*) AS count FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.pub_key=$1 AND e.kind=$2 AND t.name='d' AND t.value_hex=$3 AND e.created_at >= $4 LIMIT 1;")
+                    .bind(hex::decode(&e.pubkey).ok())
+                    .bind(e.kind as i64)
+                    .bind(hex::decode(d_tag).ok())
+                    .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
+                    .fetch_one(&mut tx)
+                    .await?
+            } else {
+                sqlx::query_scalar(
+                    "SELECT count(*) AS count FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.pub_key=$1 AND e.kind=$2 AND t.name='d' AND t.value=$3 AND e.created_at >= $4 LIMIT 1;")
+                    .bind(hex::decode(&e.pubkey).ok())
+                    .bind(e.kind as i64)
+                    .bind(d_tag.as_bytes())
+                    .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
+                    .fetch_one(&mut tx)
+                    .await?
+            };
+            // if any rows were returned, then some newer event with
+            // the same author/kind/tag value exist, and we can ignore
+            // this event.
+            if repl_count > 0 {
+                return Ok(0)
+            }
+        }
         // ignore if the event hash is a duplicate.
         let mut ins_count = sqlx::query(
             r#"INSERT INTO "event"
@@ -118,26 +161,12 @@ ON CONFLICT (id) DO NOTHING"#,
                 }
             }
         }
-
-        // if this event is replaceable update, hide every other replaceable
-        // event with the same kind from the same author that was issued
-        // earlier than this.
-        if e.kind == 3 && self.settings.cleanup_contact_list {
-            sqlx::query("delete from \"event\" where id != $1 and kind = 3 and pub_key = $2")
-                .bind(&id_blob)
-                .bind(hex::decode(&e.pubkey).ok())
-                .execute(&mut tx)
-                .await?;
-        } else if e.kind == 0 || e.kind == 3 || (e.kind >= 10000 && e.kind < 20000) {
-            let update_count = sqlx::query("UPDATE \"event\" SET hidden = 1::bit(1) \
-            WHERE id != $1 AND kind = $2 AND pub_key = $3 AND created_at <= $4 and hidden != 1::bit(1)")
-                .bind(&id_blob)
+        if e.is_replaceable() {
+            let update_count = sqlx::query("DELETE FROM \"event\" WHERE kind=$1 and pub_key = $2 and id not in (select id from \"event\" where kind=$1 and pub_key=$2 order by created_at desc limit 1);")
                 .bind(e.kind as i64)
                 .bind(hex::decode(&e.pubkey).ok())
-                .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
                 .execute(&mut tx)
-                .await?
-                .rows_affected();
+                .await?.rows_affected();
             if update_count > 0 {
                 info!(
                     "hid {} older replaceable kind {} events for author: {:?}",
@@ -147,7 +176,33 @@ ON CONFLICT (id) DO NOTHING"#,
                 );
             }
         }
-
+        // parameterized replaceable events
+        // check for parameterized replaceable events that would be hidden; don't insert these either.
+        if let Some(d_tag) = e.distinct_param() {
+            let update_count = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
+                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=$1 AND e.pub_key=$2 AND t.name='d' AND t.value_hex=$3 ORDER BY created_at DESC OFFSET 1);")
+                    .bind(e.kind as i64)
+                    .bind(hex::decode(&e.pubkey).ok())
+                    .bind(hex::decode(d_tag).ok())
+                    .execute(&mut tx)
+                    .await?.rows_affected()
+            } else {
+                sqlx::query("DELETE FROM event WHERE kind=$1 AND pub_key=$2 AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=$1 AND e.pub_key=$2 AND t.name='d' AND t.value=$3 ORDER BY created_at DESC OFFSET 1);")
+                    .bind(e.kind as i64)
+                    .bind(hex::decode(&e.pubkey).ok())
+                    .bind(d_tag.as_bytes())
+                    .execute(&mut tx)
+                    .await?.rows_affected()
+            };
+            if update_count > 0 {
+                info!(
+                    "removed {} older parameterized replaceable kind {} events for author: {:?}",
+                    update_count,
+                    e.kind,
+                    e.get_author_prefix()
+                );
+            }
+        }
         // if this event is a deletion, hide the referenced events from the same author.
         if e.kind == 5 {
             let event_candidates = e.tag_values_by_name("e");
@@ -223,6 +278,7 @@ ON CONFLICT (id) DO NOTHING"#,
     ) -> Result<()> {
         let start = Instant::now();
         let mut row_count: usize = 0;
+        let metrics = &self.metrics;
 
         for filter in sub.filters.iter() {
             let start = Instant::now();
@@ -286,7 +342,7 @@ ON CONFLICT (id) DO NOTHING"#,
 
                 // check if this is still active; every 100 rows
                 if row_count % 100 == 0 && abandon_query_rx.try_recv().is_ok() {
-                    debug!("query aborted (cid: {}, sub: {:?})", client_id, sub.id);
+                    debug!("query cancelled by client (cid: {}, sub: {:?})", client_id, sub.id);
                     return Ok(());
                 }
 
@@ -302,6 +358,7 @@ ON CONFLICT (id) DO NOTHING"#,
                         if last_successful_send + abort_cutoff < Instant::now() {
                             // the queue has been full for too long, abort
                             info!("aborting database query due to slow client");
+                            metrics.query_aborts.with_label_values(&["slowclient"]).inc();
                             return Ok(());
                         }
                         // give the queue a chance to clear before trying again
@@ -419,7 +476,7 @@ ON CONFLICT (id) DO NOTHING"#,
             .bind(hex::decode(pub_key).ok())
             .fetch_optional(&self.conn)
             .await?
-            .ok_or(error::Error::SqlError(RowNotFound))
+            .ok_or(error::Error::SqlxError(RowNotFound))
     }
 
     async fn get_oldest_user_verification(&self, before: u64) -> Result<VerificationRecord> {
@@ -442,7 +499,7 @@ ON CONFLICT (id) DO NOTHING"#,
             .bind(Utc.timestamp_opt(before as i64, 0).unwrap())
             .fetch_optional(&self.conn)
             .await?
-            .ok_or(error::Error::SqlError(RowNotFound))
+            .ok_or(error::Error::SqlxError(RowNotFound))
     }
 }
 

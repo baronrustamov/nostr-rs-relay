@@ -2,13 +2,17 @@
 
 This is a [nostr](https://github.com/nostr-protocol/nostr) relay,
 written in Rust.  It currently supports the entire relay protocol, and
-persists data with SQLite.
+persists data with SQLite.  There is experimental support for
+Postgresql.
 
 The project master repository is available on
 [sourcehut](https://sr.ht/~gheartsfield/nostr-rs-relay/), and is
 mirrored on [GitHub](https://github.com/scsibug/nostr-rs-relay).
 
 [![builds.sr.ht status](https://builds.sr.ht/~gheartsfield/nostr-rs-relay/commits/master.svg)](https://builds.sr.ht/~gheartsfield/nostr-rs-relay/commits/master?)
+
+![Github CI](https://github.com/schlunsen/nostr-rs-relay/actions/workflows/ci.yml/badge.svg)
+
 
 ## Features
 
@@ -28,8 +32,9 @@ mirrored on [GitHub](https://github.com/scsibug/nostr-rs-relay).
 - [x] NIP-16: [Event Treatment](https://github.com/nostr-protocol/nips/blob/master/16.md)
 - [x] NIP-20: [Command Results](https://github.com/nostr-protocol/nips/blob/master/20.md)
 - [x] NIP-22: [Event `created_at` limits](https://github.com/nostr-protocol/nips/blob/master/22.md) (_future-dated events only_)
-- [x] NIP-26: [Event Delegation](https://github.com/nostr-protocol/nips/blob/master/26.md)
+- [ ] NIP-26: [Event Delegation](https://github.com/nostr-protocol/nips/blob/master/26.md) (_implemented, but currently disabled_)
 - [x] NIP-28: [Public Chat](https://github.com/nostr-protocol/nips/blob/master/28.md)
+- [x] NIP-33: [Parameterized Replaceable Events](https://github.com/nostr-protocol/nips/blob/master/33.md)
 
 ## Quick Start
 
@@ -82,6 +87,38 @@ Text Note [81cf...2652] from 296a...9b92 5 seconds ago
 A pre-built container is also available on DockerHub:
 https://hub.docker.com/r/scsibug/nostr-rs-relay
 
+## Build and Run (without Docker)
+
+Building `nostr-rs-relay` requires an installation of Cargo & Rust: https://www.rust-lang.org/tools/install
+
+Clone this repository, and then build a release version of the relay:
+
+```console
+$ git clone -q https://git.sr.ht/\~gheartsfield/nostr-rs-relay
+$ cd nostr-rs-relay
+$ cargo build -q -r
+```
+
+The relay executable is now located in
+`target/release/nostr-rs-relay`.  In order to run it with logging
+enabled, execute it with the `RUST_LOG` variable set:
+
+```console
+$ RUST_LOG=warn,nostr_rs_relay=info ./target/release/nostr-rs-relay
+Dec 26 10:31:56.455  INFO nostr_rs_relay: Starting up from main
+Dec 26 10:31:56.464  INFO nostr_rs_relay::server: listening on: 0.0.0.0:8080
+Dec 26 10:31:56.466  INFO nostr_rs_relay::server: db writer created
+Dec 26 10:31:56.466  INFO nostr_rs_relay::db: Built a connection pool "event writer" (min=1, max=2)
+Dec 26 10:31:56.466  INFO nostr_rs_relay::db: opened database "./nostr.db" for writing
+Dec 26 10:31:56.466  INFO nostr_rs_relay::schema: DB version = 11
+Dec 26 10:31:56.467  INFO nostr_rs_relay::db: Built a connection pool "maintenance writer" (min=1, max=2)
+Dec 26 10:31:56.467  INFO nostr_rs_relay::server: control message listener started
+Dec 26 10:31:56.468  INFO nostr_rs_relay::db: Built a connection pool "client query" (min=4, max=8)
+```
+
+You now have a running relay, on port `8080`.  Use a `nostr` client or
+`websocat` to connect and send/query for events.
+
 ## Configuration
 
 The sample [`config.toml`](config.toml) file demonstrates the
@@ -116,3 +153,8 @@ To chat about `nostr-rs-relay` on `nostr` itself; visit our channel on [anigma](
 License
 ---
 This project is MIT licensed.
+
+External Documentation and Links
+---
+
+* [BlockChainCaffe's Nostr Relay Setup Guide](https://github.com/BlockChainCaffe/Nostr-Relay-Setup-Guide)

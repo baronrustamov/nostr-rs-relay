@@ -21,8 +21,9 @@ description = "A newly created nostr-rs-relay.\n\nCustomize this with your own i
 #tracing = true
 
 [database]
-# Database engine (sqlite/postgres)
-engine = "postgres"
+# Database engine (sqlite/postgres).  Defaults to sqlite.
+# Support for postgres is currently experimental.
+#engine = "sqlite"
 
 # Directory for SQLite files.  Defaults to the current directory.  Can
 # also be specified (and overriden) with the "--db dirname" command
@@ -31,6 +32,7 @@ data_directory = "."
 
 
 # Use an in-memory database instead of 'nostr.db'.
+# Requires sqlite engine.
 # Caution; this will not survive a process restart!
 #in_memory = false
 
@@ -39,11 +41,13 @@ data_directory = "."
 # Minimum number of SQLite reader connections
 #min_conn = 4
 
-# Maximum number of SQLite reader connections
-#max_conn = 128
+# Maximum number of SQLite reader connections.  Recommend setting this
+# to approx the number of cores.
+#max_conn = 8
 
-# Postgres database settings
-connection = "postgresql://postgres:nostr@localhost:7500/nostr"
+# Database connection string.  Required for postgres; not used for
+# sqlite.
+#connection = "postgresql://postgres:nostr@localhost:7500/nostr"
 
 [network]
 # Bind to this network address
@@ -71,13 +75,18 @@ cleanup_contact_list = true
 
 [limits]
 # Limit events created per second, averaged over one minute.  Must be
-# an integer.  If not set (or set to 0), defaults to unlimited.  Note:
+# an integer.  If not set (or set to 0), there is no limit.  Note:
 # this is for the server as a whole, not per-connection.
-# messages_per_sec = 0
+#
+# Limiting event creation is highly recommended if your relay is
+# public!
+#
+#messages_per_sec = 5
 
-# Limit client subscriptions created per second, averaged over one
-# minute.  Must be an integer.  If not set (or set to 0), defaults to
-# unlimited.
+# Limit client subscriptions created, averaged over one minute.  Must
+# be an integer.  If not set (or set to 0), defaults to unlimited.
+# Strongly recommended to set this to a low value such as 10 to ensure
+# fair service.
 #subscriptions_per_min = 0
 
 # UNIMPLEMENTED...
@@ -110,6 +119,11 @@ cleanup_contact_list = true
 
 # Whitelist to bypass rate limits for publishing events
 #rate_limit_whitelist = ["127.0.0.1"]
+
+# Event kind blacklist. Events with these kinds will be discarded.
+#event_kind_blacklist = [
+#    70202,
+#]
 
 [authorization]
 # Pubkey addresses in this array are whitelisted for event publishing.

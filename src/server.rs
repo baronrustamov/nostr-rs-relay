@@ -3,6 +3,7 @@ use crate::close::Close;
 use crate::close::CloseCmd;
 use crate::config::{Settings, VerifiedUsersMode};
 use crate::conn;
+use crate::repo::NostrRepo;
 use crate::db;
 use crate::db::SubmittedEvent;
 use crate::error::{Error, Result};
@@ -11,8 +12,10 @@ use crate::event::EventCmd;
 use crate::info::RelayInfo;
 use crate::nip05;
 use crate::notice::Notice;
-use crate::repo::NostrRepo;
 use crate::subscription::Subscription;
+use prometheus::IntCounterVec;
+use prometheus::IntGauge;
+use prometheus::{Encoder, Histogram, IntCounter, HistogramOpts, Opts, Registry, TextEncoder};
 use futures::SinkExt;
 use futures::StreamExt;
 use governor::{Jitter, Quota, RateLimiter};
@@ -23,15 +26,15 @@ use hyper::upgrade::Upgraded;
 use hyper::{
     header, server::conn::AddrStream, upgrade, Body, Request, Response, Server, StatusCode,
 };
-use prometheus::{CounterVec, Encoder, Histogram, HistogramOpts, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::mpsc::Receiver as MpscReceiver;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver as MpscReceiver;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::runtime::Builder;
@@ -39,14 +42,15 @@ use tokio::sync::broadcast::{self, Receiver, Sender};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_tungstenite::WebSocketStream;
-use tracing::*;
+use tracing::{debug, error, info, trace, warn};
 use tungstenite::error::CapacityError::MessageTooLong;
 use tungstenite::error::Error as WsError;
 use tungstenite::handshake;
 use tungstenite::protocol::Message;
 use tungstenite::protocol::WebSocketConfig;
 
-/// Handle arbitrary HTTP requests, including for WebSocket upgrades.
+/// Handle arbitrary HTTP requests, including for `WebSocket` upgrades.
+#[allow(clippy::too_many_arguments)]
 async fn handle_web_request(
     mut request: Request<Body>,
     repo: Arc<dyn NostrRepo>,
@@ -79,6 +83,7 @@ async fn handle_web_request(
                             Ok(upgraded) => {
                                 // set WebSocket configuration options
                                 let config = WebSocketConfig {
+                                    max_send_queue: Some(1024),
                                     max_message_size: settings.limits.max_ws_message_bytes,
                                     max_frame_size: settings.limits.max_ws_frame_bytes,
                                     ..Default::default()
@@ -123,9 +128,8 @@ async fn handle_web_request(
                             // todo: trace, don't print...
                             Err(e) => println!(
                                 "error when trying to upgrade connection \
-                                 from address {} to websocket connection. \
-                                 Error is: {}",
-                                remote_addr, e
+                                 from address {remote_addr} to websocket connection. \
+                                 Error is: {e}",
                             ),
                         }
                     });
@@ -135,7 +139,7 @@ async fn handle_web_request(
                 Err(error) => {
                     warn!("websocket response failed");
                     let mut res =
-                        Response::new(Body::from(format!("Failed to create websocket: {}", error)));
+                        Response::new(Body::from(format!("Failed to create websocket: {error}")));
                     *res.status_mut() = StatusCode::BAD_REQUEST;
                     return Ok(res);
                 }
@@ -165,12 +169,10 @@ async fn handle_web_request(
                 }
             }
             Ok(Response::builder()
-                .status(200)
-                .header("Content-Type", "text/plain")
-                .body(Body::from(
-                    "A nostr server is here https://github.com/v0l/nostr-rs-relay",
-                ))
-                .unwrap())
+               .status(200)
+               .header("Content-Type", "text/plain")
+               .body(Body::from("Please use a Nostr client to connect."))
+               .unwrap())
         }
         ("/metrics", false) => {
             let mut buffer = vec![];
@@ -179,17 +181,17 @@ async fn handle_web_request(
             encoder.encode(&metric_families, &mut buffer).unwrap();
 
             Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain")
-                .body(Body::from(buffer))
-                .unwrap())
+               .status(StatusCode::OK)
+               .header("Content-Type", "text/plain")
+               .body(Body::from(buffer))
+               .unwrap())
         }
         (_, _) => {
             //handle any other url
             Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Nothing here."))
-                .unwrap())
+               .status(StatusCode::NOT_FOUND)
+               .body(Body::from("Nothing here."))
+               .unwrap())
         }
     }
 }
@@ -197,7 +199,7 @@ async fn handle_web_request(
 fn get_header_string(header: &str, headers: &HeaderMap) -> Option<String> {
     headers
         .get(header)
-        .and_then(|x| x.to_str().ok().map(|x| x.to_string()))
+        .and_then(|x| x.to_str().ok().map(std::string::ToString::to_string))
 }
 
 // return on a control-c or internally requested shutdown signal
@@ -207,24 +209,98 @@ async fn ctrl_c_or_signal(mut shutdown_signal: Receiver<()>) {
     loop {
         tokio::select! {
             _ = shutdown_signal.recv() => {
-            info!("Shutting down webserver as requested");
-                    // server shutting down, exit loop
-                    break;
-                },
-            _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down webserver due to SIGINT");
-                    break;
+                info!("Shutting down webserver as requested");
+                // server shutting down, exit loop
+                break;
             },
-        _ = term_signal.recv() => {
-        info!("Shutting down webserver due to SIGTERM");
-        break;
-        },
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down webserver due to SIGINT");
+                break;
+            },
+            _ = term_signal.recv() => {
+                info!("Shutting down webserver due to SIGTERM");
+                break;
+            },
         }
     }
 }
 
+fn create_metrics() -> (Registry, NostrMetrics) {
+    // setup prometheus registry
+    let registry = Registry::new();
+
+    let query_sub = Histogram::with_opts(HistogramOpts::new(
+        "nostr_query_seconds",
+        "Subscription response times",
+    )).unwrap();
+    let query_db = Histogram::with_opts(HistogramOpts::new(
+        "nostr_filter_seconds",
+        "Filter SQL query times",
+    )).unwrap();
+    let write_events = Histogram::with_opts(HistogramOpts::new(
+        "nostr_events_write_seconds",
+        "Event writing response times",
+    )).unwrap();
+    let sent_events = IntCounterVec::new(
+	Opts::new("nostr_events_sent_total", "Events sent to clients"),
+	vec!["source"].as_slice(),
+    ).unwrap();
+    let connections = IntCounter::with_opts(Opts::new(
+        "nostr_connections_total",
+        "New connections",
+    )).unwrap();
+    let db_connections = IntGauge::with_opts(Opts::new(
+        "nostr_db_connections", "Active database connections"
+    )).unwrap();
+    let query_aborts = IntCounterVec::new(
+        Opts::new("nostr_query_abort_total", "Aborted queries"),
+        vec!["reason"].as_slice(),
+    ).unwrap();
+    let cmd_req = IntCounter::with_opts(Opts::new(
+        "nostr_cmd_req_total",
+        "REQ commands",
+    )).unwrap();
+    let cmd_event = IntCounter::with_opts(Opts::new(
+        "nostr_cmd_event_total",
+        "EVENT commands",
+    )).unwrap();
+    let cmd_close = IntCounter::with_opts(Opts::new(
+        "nostr_cmd_close_total",
+        "CLOSE commands",
+    )).unwrap();
+    let disconnects = IntCounterVec::new(
+        Opts::new("nostr_disconnects_total", "Client disconnects"),
+        vec!["reason"].as_slice(),
+        ).unwrap();
+    registry.register(Box::new(query_sub.clone())).unwrap();
+    registry.register(Box::new(query_db.clone())).unwrap();
+    registry.register(Box::new(write_events.clone())).unwrap();
+    registry.register(Box::new(sent_events.clone())).unwrap();
+    registry.register(Box::new(connections.clone())).unwrap();
+    registry.register(Box::new(db_connections.clone())).unwrap();
+    registry.register(Box::new(query_aborts.clone())).unwrap();
+    registry.register(Box::new(cmd_req.clone())).unwrap();
+    registry.register(Box::new(cmd_event.clone())).unwrap();
+    registry.register(Box::new(cmd_close.clone())).unwrap();
+    registry.register(Box::new(disconnects.clone())).unwrap();
+    let metrics = NostrMetrics {
+        query_sub,
+        query_db,
+        write_events,
+        sent_events,
+        connections,
+        db_connections,
+	disconnects,
+        query_aborts,
+	cmd_req,
+	cmd_event,
+	cmd_close,
+    };
+    (registry,metrics)
+}
+
 /// Start running a Nostr relay server.
-pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result<(), Error> {
+pub fn start_server(settings: &Settings, shutdown_rx: MpscReceiver<()>) -> Result<(), Error> {
     trace!("Config: {:?}", settings);
     // do some config validation.
     if !Path::new(&settings.database.data_directory).is_dir() {
@@ -266,14 +342,19 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
     // configure tokio runtime
     let rt = Builder::new_multi_thread()
         .enable_all()
-        .thread_name("tokio-ws")
-        // limit concurrent SQLite blocking threads
+        .thread_name_fn(|| {
+            // give each thread a unique numeric name
+            static ATOMIC_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1,Ordering::SeqCst);
+            format!("tokio-ws-{id}")
+        })
+    // limit concurrent SQLite blocking threads
         .max_blocking_threads(settings.limits.max_blocking_threads)
         .on_thread_start(|| {
-            trace!("started new thread");
+            trace!("started new thread: {:?}", std::thread::current().name());
         })
         .on_thread_stop(|| {
-            trace!("stopping thread");
+            trace!("stopped thread: {:?}", std::thread::current().name());
         })
         .build()
         .unwrap();
@@ -282,8 +363,6 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
         let broadcast_buffer_limit = settings.limits.broadcast_buffer;
         let persist_buffer_limit = settings.limits.event_persist_buffer;
         let verified_users_active = settings.verified_users.is_active();
-        let db_min_conn = settings.database.min_conn;
-        let db_max_conn = settings.database.max_conn;
         let settings = settings.clone();
         info!("listening on: {}", socket_addr);
         // all client-submitted valid events are broadcast to every
@@ -307,69 +386,27 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
         // metadata events.
         let (metadata_tx, metadata_rx) = broadcast::channel::<Event>(4096);
 
-        // setup prometheus registry
-        let registry = Registry::new();
-
-        let query_sub = Histogram::with_opts(HistogramOpts::new(
-            "query_sub",
-            "Subscription response times",
-        ))
-        .unwrap();
-        let write_events = Histogram::with_opts(HistogramOpts::new(
-            "write_event",
-            "Event writing response times",
-        ))
-        .unwrap();
-        let connections = CounterVec::new(
-            Opts::new("connections", "New connections"),
-            vec!["origin"].as_slice(),
-        )
-        .unwrap();
-        registry.register(Box::new(query_sub.clone())).unwrap();
-        registry.register(Box::new(write_events.clone())).unwrap();
-        registry.register(Box::new(connections.clone())).unwrap();
-
-        let db_dir = &settings.database.data_directory;
-        let full_path = Path::new(db_dir).join(db::DB_FILE);
-
-        let metrics = NostrMetrics {
-            query_sub,
-            write_events,
-            connections,
-        };
-
-        // create a connection pool
+	let (registry, metrics) = create_metrics();
+        // build a repository for events
         let repo = db::build_repo(&settings, metrics.clone()).await;
-        if settings.database.in_memory {
-            info!("using in-memory database, this will not persist a restart!");
-        } else {
-            info!("opened database {} for writing", full_path.display());
-        }
-        if let Ok(v) = repo.migrate_up().await {
-            info!("Database migrations complete @ version {}", v);
-        }
-
-        // start the database writer thread.  Give it a channel for
+        // start the database writer task.  Give it a channel for
         // writing events, and for publishing events that have been
         // written (to all connected clients).
-        tokio::task::spawn(db::db_writer(
-            repo.clone(),
-            settings.clone(),
-            event_rx,
-            bcast_tx.clone(),
-            metadata_tx.clone(),
-            shutdown_listen,
-        ));
+        tokio::task::spawn(
+            db::db_writer(
+                repo.clone(),
+                settings.clone(),
+                event_rx,
+                bcast_tx.clone(),
+                metadata_tx.clone(),
+                shutdown_listen,
+            ));
         info!("db writer created");
 
         // create a nip-05 verifier thread; if enabled.
         if settings.verified_users.mode != VerifiedUsersMode::Disabled {
-            let verifier_opt = nip05::Verifier::new(
-                metadata_rx,
-                bcast_tx.clone(),
-                settings.clone(),
-                repo.clone(),
-            );
+            let verifier_opt =
+                nip05::Verifier::new(repo.clone(), metadata_rx, bcast_tx.clone(), settings.clone());
             if let Ok(mut v) = verifier_opt {
                 if verified_users_active {
                     tokio::task::spawn(async move {
@@ -380,8 +417,6 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
             }
         }
 
-        // db::db_maintenance(maintenance_pool).await;
-
         // listen for (external to tokio) shutdown request
         let controlled_shutdown = invoke_shutdown.clone();
         tokio::spawn(async move {
@@ -390,10 +425,9 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
                 Ok(()) => {
                     info!("control message requesting shutdown");
                     controlled_shutdown.send(()).ok();
-                }
+                },
                 Err(std::sync::mpsc::RecvError) => {
-                    // FIXME: spurious error on startup?
-                    debug!("shutdown requestor is disconnected");
+                    trace!("shutdown requestor is disconnected (this is normal)");
                 }
             };
         });
@@ -407,16 +441,19 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
             info!("shutting down due to SIGINT (main)");
             ctrl_c_shutdown.send(()).ok();
         });
+        // spawn a task to check the pool size.
+        //let pool_monitor = pool.clone();
+        //tokio::spawn(async move {db::monitor_pool("reader", pool_monitor).await;});
 
         // A `Service` is needed for every connection, so this
         // creates one from our `handle_request` function.
         let make_svc = make_service_fn(|conn: &AddrStream| {
+            let repo = repo.clone();
             let remote_addr = conn.remote_addr();
             let bcast = bcast_tx.clone();
             let event = event_tx.clone();
             let stop = invoke_shutdown.clone();
             let settings = settings.clone();
-            let repo = repo.clone();
             let registry = registry.clone();
             let metrics = metrics.clone();
             async move {
@@ -441,7 +478,7 @@ pub fn start_server(settings: Settings, shutdown_rx: MpscReceiver<()>) -> Result
             .with_graceful_shutdown(ctrl_c_or_signal(webserver_shutdown_listen));
         // run hyper in this thread.  This is why the thread does not return.
         if let Err(e) = server.await {
-            eprintln!("server error: {}", e);
+            eprintln!("server error: {e}");
         }
     });
     Ok(())
@@ -459,11 +496,15 @@ pub enum NostrMessage {
     CloseMsg(CloseCmd),
 }
 
-/// Convert Message to NostrMessage
-fn convert_to_msg(msg: String, max_bytes: Option<usize>) -> Result<NostrMessage> {
-    let parsed_res: Result<NostrMessage> = serde_json::from_str(&msg).map_err(|e| e.into());
+/// Convert Message to `NostrMessage`
+fn convert_to_msg(msg: &str, max_bytes: Option<usize>) -> Result<NostrMessage> {
+    let parsed_res: Result<NostrMessage> = serde_json::from_str(msg).map_err(std::convert::Into::into);
     match parsed_res {
         Ok(m) => {
+            if let NostrMessage::SubMsg(_) = m {
+                // note; this only prints the first 16k of a REQ and then truncates.
+                trace!("REQ: {:?}",msg);
+            };
             if let NostrMessage::EventMsg(_) = m {
                 if let Some(max_size) = max_bytes {
                     // check length, ensure that some max size is set.
@@ -475,15 +516,15 @@ fn convert_to_msg(msg: String, max_bytes: Option<usize>) -> Result<NostrMessage>
             Ok(m)
         }
         Err(e) => {
-            debug!("proto parse error: {:?}", e);
-            debug!("parse error on message: {}", msg.trim());
+            trace!("proto parse error: {:?}", e);
+            trace!("parse error on message: {:?}", msg.trim());
             Err(Error::ProtoParseError)
         }
     }
 }
 
-/// Turn a string into a NOTICE message ready to send over a WebSocket
-fn make_notice_message(notice: Notice) -> Message {
+/// Turn a string into a NOTICE message ready to send over a `WebSocket`
+fn make_notice_message(notice: &Notice) -> Message {
     let json = match notice {
         Notice::Message(ref msg) => json!(["NOTICE", msg]),
         Notice::EventResult(ref res) => json!(["OK", res.id, res.status.to_bool(), res.msg]),
@@ -500,8 +541,9 @@ struct ClientInfo {
 
 /// Handle new client connections.  This runs through an event loop
 /// for all client communication.
+#[allow(clippy::too_many_arguments)]
 async fn nostr_server(
-    pool: Arc<dyn NostrRepo>,
+    repo: Arc<dyn NostrRepo>,
     client_info: ClientInfo,
     settings: Settings,
     mut ws_stream: WebSocketStream<Upgraded>,
@@ -540,7 +582,7 @@ async fn nostr_server(
     // we will send out the tx handle to any query we generate.
     // this has capacity for some of the larger requests we see, which
     // should allow the DB thread to release the handle earlier.
-    let (query_tx, mut query_rx) = mpsc::channel::<db::QueryResult>(20000);
+    let (query_tx, mut query_rx) = mpsc::channel::<db::QueryResult>(20_000);
     // Create channel for receiving NOTICEs
     let (notice_tx, mut notice_rx) = mpsc::channel::<Notice>(128);
 
@@ -564,28 +606,23 @@ async fn nostr_server(
     // and how many it received from queries.
     let mut client_published_event_count: usize = 0;
     let mut client_received_event_count: usize = 0;
-    debug!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
+    info!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
     let origin = client_info.origin.unwrap_or_else(|| "<unspecified>".into());
     let user_agent = client_info
         .user_agent
         .unwrap_or_else(|| "<unspecified>".into());
-    debug!(
+    info!(
         "cid: {}, origin: {:?}, user-agent: {:?}",
         cid, origin, user_agent
     );
 
-    let mut metric_map: HashMap<&str, &str> = HashMap::new();
-    metric_map.insert("origin", origin.as_str());
-
-    metrics
-        .connections
-        .get_metric_with(&metric_map)
-        .unwrap()
-        .inc();
+    // Measure connections
+    metrics.connections.inc();
 
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
+		        metrics.disconnects.with_label_values(&["shutdown"]).inc();
                 info!("Close connection down due to shutdown, client: {}, ip: {:?}, connected: {:?}", cid, conn.ip(), orig_start.elapsed());
                 // server shutting down, exit loop
                 break;
@@ -595,22 +632,24 @@ async fn nostr_server(
                 // if it has been too long, disconnect
                 if last_message_time.elapsed() > max_quiet_time {
                     debug!("ending connection due to lack of client ping response");
+		            metrics.disconnects.with_label_values(&["timeout"]).inc();
                     break;
                 }
                 // Send a ping
                 ws_stream.send(Message::Ping(Vec::new())).await.ok();
             },
             Some(notice_msg) = notice_rx.recv() => {
-                ws_stream.send(make_notice_message(notice_msg)).await.ok();
+                ws_stream.send(make_notice_message(&notice_msg)).await.ok();
             },
             Some(query_result) = query_rx.recv() => {
                 // database informed us of a query result we asked for
                 let subesc = query_result.sub_id.replace('"', "");
                 if query_result.event == "EOSE" {
-                    let send_str = format!("[\"EOSE\",\"{}\"]", subesc);
+                    let send_str = format!("[\"EOSE\",\"{subesc}\"]");
                     ws_stream.send(Message::Text(send_str)).await.ok();
                 } else {
                     client_received_event_count += 1;
+		            metrics.sent_events.with_label_values(&["db"]).inc();
                     // send a result
                     let send_str = format!("[\"EVENT\",\"{}\",{}]", subesc, &query_result.event);
                     ws_stream.send(Message::Text(send_str)).await.ok();
@@ -633,7 +672,8 @@ async fn nostr_server(
                                global_event.get_event_id_prefix());
                         // create an event response and send it
                         let subesc = s.replace('"', "");
-                        ws_stream.send(Message::Text(format!("[\"EVENT\",\"{}\",{}]", subesc, event_str))).await.ok();
+			            metrics.sent_events.with_label_values(&["realtime"]).inc();
+                        ws_stream.send(Message::Text(format!("[\"EVENT\",\"{subesc}\",{event_str}]"))).await.ok();
                     } else {
                         warn!("could not serialize event: {:?}", global_event.get_event_id_prefix());
                     }
@@ -645,11 +685,11 @@ async fn nostr_server(
                 // Consume text messages from the client, parse into Nostr messages.
                 let nostr_msg = match ws_next {
                     Some(Ok(Message::Text(m))) => {
-                        convert_to_msg(m,settings.limits.max_event_bytes)
+                        convert_to_msg(&m,settings.limits.max_event_bytes)
                     },
-            Some(Ok(Message::Binary(_))) => {
-            ws_stream.send(
-                make_notice_message(Notice::message("binary messages are not accepted".into()))).await.ok();
+                    Some(Ok(Message::Binary(_))) => {
+                        ws_stream.send(
+                            make_notice_message(&Notice::message("binary messages are not accepted".into()))).await.ok();
                         continue;
                     },
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
@@ -657,27 +697,32 @@ async fn nostr_server(
                         // send responses automatically.
                         continue;
                     },
-            Some(Err(WsError::Capacity(MessageTooLong{size, max_size}))) => {
-            ws_stream.send(
-                make_notice_message(Notice::message(format!("message too large ({} > {})",size, max_size)))).await.ok();
+                    Some(Err(WsError::Capacity(MessageTooLong{size, max_size}))) => {
+                        ws_stream.send(
+                            make_notice_message(&Notice::message(format!("message too large ({size} > {max_size})")))).await.ok();
                         continue;
-            },
+                    },
                     None |
-            Some(Ok(Message::Close(_)) |
-             Err(WsError::AlreadyClosed | WsError::ConnectionClosed |
-                 WsError::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)))
+                    Some(Ok(Message::Close(_)) |
+                         Err(WsError::AlreadyClosed | WsError::ConnectionClosed |
+                             WsError::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)))
                         => {
                             debug!("websocket close from client (cid: {}, ip: {:?})",cid, conn.ip());
-                        break;
-                    },
+			                metrics.disconnects.with_label_values(&["normal"]).inc();
+                            break;
+                        },
                     Some(Err(WsError::Io(e))) => {
                         // IO errors are considered fatal
                         warn!("IO error (cid: {}, ip: {:?}): {:?}", cid, conn.ip(), e);
+			            metrics.disconnects.with_label_values(&["error"]).inc();
+
                         break;
                     }
                     x => {
                         // default condition on error is to close the client connection
                         info!("unknown error (cid: {}, ip: {:?}): {:?} (closing conn)", cid, conn.ip(), x);
+			            metrics.disconnects.with_label_values(&["error"]).inc();
+
                         break;
                     }
                 };
@@ -689,32 +734,29 @@ async fn nostr_server(
                         // handle each type of message
                         let evid = ec.event_id().to_owned();
                         let parsed : Result<Event> = Result::<Event>::from(ec);
+			            metrics.cmd_event.inc();
                         match parsed {
                             Ok(e) => {
                                 let id_prefix:String = e.id.chars().take(8).collect();
-                                debug!("successfully parsed/validated event: {:?} (cid: {})", id_prefix, cid);
+                                debug!("successfully parsed/validated event: {:?} (cid: {}, kind: {})", id_prefix, cid, e.kind);
                                 // check if the event is too far in the future.
-                                if !e.is_valid_timestamp(settings.options.reject_future_seconds) {
-                                    info!("client: {} sent a far future-dated event", cid);
-                                    if let Some(fut_sec) = settings.options.reject_future_seconds {
-                                        let msg = format!("The event created_at field is out of the acceptable range (+{}sec) for this relay.",fut_sec);
-                                        let notice = Notice::invalid(e.id, &msg);
-                                        ws_stream.send(make_notice_message(notice)).await.ok();
-                                    }
-                                } else if !conn.check_pub_rate_limit(){
-                                    info!("client: {} ({}) was rate limited for publishing too many events", cid, conn.ip());
-                                    let notice = Notice::invalid(e.id, "Rate limit exceeded, try again later");
-                                    ws_stream.send(make_notice_message(notice)).await.ok();
-                                } else {
+                                if e.is_valid_timestamp(settings.options.reject_future_seconds) {
                                     // Write this to the database.
-                                    let submit_event = SubmittedEvent { event: e.clone(), notice_tx: notice_tx.clone() };
+                                    let submit_event = SubmittedEvent { event: e.clone(), notice_tx: notice_tx.clone(), source_ip: conn.ip().to_string()};
                                     event_tx.send(submit_event).await.ok();
                                     client_published_event_count += 1;
+                                } else {
+                                    info!("client: {} sent a far future-dated event", cid);
+                                    if let Some(fut_sec) = settings.options.reject_future_seconds {
+                                        let msg = format!("The event created_at field is out of the acceptable range (+{fut_sec}sec) for this relay.");
+                                        let notice = Notice::invalid(e.id, &msg);
+                                        ws_stream.send(make_notice_message(&notice)).await.ok();
+                                    }
                                 }
                             },
                             Err(e) => {
                                 info!("client sent an invalid event (cid: {})", cid);
-                                ws_stream.send(make_notice_message(Notice::invalid(evid, &format!("{}", e)))).await.ok();
+                                ws_stream.send(make_notice_message(&Notice::invalid(evid, &format!("{e}")))).await.ok();
                             }
                         }
                     },
@@ -725,59 +767,63 @@ async fn nostr_server(
                         // * registering the subscription so future events can be matched
                         // * making a channel to cancel to request later
                         // * sending a request for a SQL query
-            // Do nothing if the sub already exists.
-            if !conn.has_subscription(&s) {
-                if let Some(ref lim) = sub_lim_opt {
-                lim.until_ready_with_jitter(jitter).await;
-                }
+                        // Do nothing if the sub already exists.
+                        if conn.has_subscription(&s) {
+                            info!("client sent duplicate subscription, ignoring (cid: {}, sub: {:?})", cid, s.id);
+                        } else {
+			                metrics.cmd_req.inc();
+                            if let Some(ref lim) = sub_lim_opt {
+                                lim.until_ready_with_jitter(jitter).await;
+                            }
                             let (abandon_query_tx, abandon_query_rx) = oneshot::channel::<()>();
                             match conn.subscribe(s.clone()) {
-                Ok(()) => {
+                                Ok(()) => {
                                     // when we insert, if there was a previous query running with the same name, cancel it.
-                                    if let Some(previous_query) = running_queries.insert(s.id.to_owned(), abandon_query_tx) {
-                    previous_query.send(()).ok();
+                                    if let Some(previous_query) = running_queries.insert(s.id.clone(), abandon_query_tx) {
+                                        previous_query.send(()).ok();
                                     }
-                                    // start a database query.  this spawns a blocking database query on a worker thread.
-                                    pool.query_subscription(s, cid.to_owned(), query_tx.clone(), abandon_query_rx).await;
-                },
-                Err(e) => {
-                    info!("Subscription error: {} (cid: {}, sub: {:?})", e, cid, s.id);
-                                    ws_stream.send(make_notice_message(Notice::message(format!("Subscription error: {}", e)))).await.ok();
-                }
+                                    if s.needs_historical_events() {
+                                        // start a database query.  this spawns a blocking database query on a worker thread.
+                                        repo.query_subscription(s, cid.clone(), query_tx.clone(), abandon_query_rx).await.ok();
+                                    }
+                                },
+                                Err(e) => {
+                                    info!("Subscription error: {} (cid: {}, sub: {:?})", e, cid, s.id);
+                                    ws_stream.send(make_notice_message(&Notice::message(format!("Subscription error: {e}")))).await.ok();
+                                }
                             }
-            } else {
-        info!("client sent duplicate subscription, ignoring (cid: {}, sub: {:?})", cid, s.id);
-        }
+                        }
                     },
                     Ok(NostrMessage::CloseMsg(cc)) => {
                         // closing a request simply removes the subscription.
                         let parsed : Result<Close> = Result::<Close>::from(cc);
-            if let Ok(c) = parsed {
-                                // check if a query is currently
-                                // running, and remove it if so.
-                                let stop_tx = running_queries.remove(&c.id);
-                                if let Some(tx) = stop_tx {
-                                    tx.send(()).ok();
-                                }
-                                // stop checking new events against
-                                // the subscription
-                                conn.unsubscribe(&c);
-                            } else {
-                                info!("invalid command ignored");
-                                ws_stream.send(make_notice_message(Notice::message("could not parse command".into()))).await.ok();
+                        if let Ok(c) = parsed {
+			                metrics.cmd_close.inc();
+                            // check if a query is currently
+                            // running, and remove it if so.
+                            let stop_tx = running_queries.remove(&c.id);
+                            if let Some(tx) = stop_tx {
+                                tx.send(()).ok();
                             }
+                            // stop checking new events against
+                            // the subscription
+                            conn.unsubscribe(&c);
+                        } else {
+                            info!("invalid command ignored");
+                            ws_stream.send(make_notice_message(&Notice::message("could not parse command".into()))).await.ok();
+                        }
                     },
                     Err(Error::ConnError) => {
                         debug!("got connection close/error, disconnecting cid: {}, ip: {:?}",cid, conn.ip());
                         break;
                     }
                     Err(Error::EventMaxLengthError(s)) => {
-                        info!("client sent event larger ({} bytes) than max size (cid: {})", s, cid);
-                        ws_stream.send(make_notice_message(Notice::message("event exceeded max size".into()))).await.ok();
+                        info!("client sent command larger ({} bytes) than max size (cid: {})", s, cid);
+                        ws_stream.send(make_notice_message(&Notice::message("event exceeded max size".into()))).await.ok();
                     },
                     Err(Error::ProtoParseError) => {
-                        info!("client sent event that could not be parsed (cid: {})", cid);
-                        ws_stream.send(make_notice_message(Notice::message("could not parse command".into()))).await.ok();
+                        info!("client sent command that could not be parsed (cid: {})", cid);
+                        ws_stream.send(make_notice_message(&Notice::message("could not parse command".into()))).await.ok();
                     },
                     Err(e) => {
                         info!("got non-fatal error from client (cid: {}, error: {:?}", cid, e);
@@ -796,13 +842,22 @@ async fn nostr_server(
         conn.ip(),
         client_published_event_count,
         client_received_event_count,
-	orig_start.elapsed()
+        orig_start.elapsed()
     );
 }
 
 #[derive(Clone)]
 pub struct NostrMetrics {
-    pub query_sub: Histogram,
-    pub write_events: Histogram,
-    pub connections: CounterVec,
+    pub query_sub: Histogram, // response time of successful subscriptions
+    pub query_db: Histogram, // individual database query execution time
+    pub db_connections: IntGauge, // database connections in use
+    pub write_events: Histogram, // response time of event writes
+    pub sent_events: IntCounterVec, // count of events sent to clients
+    pub connections: IntCounter, // count of websocket connections
+    pub disconnects: IntCounterVec, // client disconnects
+    pub query_aborts: IntCounterVec, // count of queries aborted by server
+    pub cmd_req: IntCounter, // count of REQ commands received
+    pub cmd_event: IntCounter, // count of EVENT commands received
+    pub cmd_close: IntCounter, // count of CLOSE commands received
+
 }

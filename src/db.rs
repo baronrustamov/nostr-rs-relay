@@ -1,38 +1,59 @@
 //! Event persistence and querying
-use crate::config::{Database, Settings};
-use crate::error::Result;
-use crate::event::Event;
+//use crate::config::SETTINGS;
+use crate::config::Settings;
+use crate::error::{Error, Result};
+use crate::event::{single_char_tagname, Event};
+use crate::hexrange::hex_range;
+use crate::hexrange::HexSearch;
+use crate::nip05;
 use crate::notice::Notice;
-use crate::repo::postgres::{PostgresRepo, PostgresRepoSettings};
-use crate::repo::sqlite::SqliteRepo;
-use crate::repo::{NostrRepo, PostgresPool};
-use crate::server::NostrMetrics;
+use crate::schema::{upgrade_db, STARTUP_SQL};
+use crate::subscription::ReqFilter;
+use crate::subscription::Subscription;
+use crate::utils::{is_hex, is_lower_hex};
 use governor::clock::Clock;
 use governor::{Quota, RateLimiter};
+use hex;
+use r2d2;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::params;
+use rusqlite::types::ToSql;
+use rusqlite::OpenFlags;
+use std::fmt::Write as _;
+use std::path::Path;
+use std::thread;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
-use sqlx::{ConnectOptions, SqlitePool};
-use std::path::Path;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
+use sqlx::ConnectOptions;
+use crate::repo::sqlite::SqliteRepo;
+use crate::repo::postgres::{PostgresRepo,PostgresPool};
+use crate::repo::NostrRepo;
+use std::time::{Instant, Duration};
 use tracing::log::LevelFilter;
 use tracing::{debug, info, trace, warn};
+
+pub type SqlitePool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
+pub type PooledConnection = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 
 /// Events submitted from a client, with a return channel for notices
 pub struct SubmittedEvent {
     pub event: Event,
     pub notice_tx: tokio::sync::mpsc::Sender<Notice>,
+    pub source_ip: String,
 }
 
 /// Database file
 pub const DB_FILE: &str = "nostr.db";
-/// How many persisted events before optimization is triggered
-pub const EVENT_COUNT_OPTIMIZE_TRIGGER: usize = 500;
 
-/// Build repo
+/// How frequently to run maintenance
+/// How many persisted events before DB maintenannce is triggered.
+pub const EVENT_MAINTENANCE_FREQ_SEC: u64 = 60;
+
+/// How many persisted events before we pause for backups.
+/// It isn't clear this is enough to make the online backup API work yet.
+pub const EVENT_COUNT_BACKUP_PAUSE_TRIGGER: usize = 1000;
+
+/// Build a database connection pool.
 /// # Panics
 ///
 /// Will panic if the pool could not be created.
@@ -73,32 +94,21 @@ async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> Postgr
         },
         None => pool.clone()
     };
+
+    // Panic on migration failure
+    let version = write_pool.migrate_up().await.unwrap();
+    info!("Postgres migration completed, at v{}", version);
+
     PostgresRepo::new(pool, write_pool, metrics, PostgresRepoSettings {
         cleanup_contact_list: config.options.cleanup_contact_list
     })
 }
 
-async fn build_sqlite_pool(config: &Database, metrics: NostrMetrics) -> SqliteRepo {
-    let db_dir = &config.data_directory;
-    let full_path = Path::new(db_dir).join(DB_FILE);
-
-    let mut options = SqliteConnectOptions::new()
-        .filename(full_path)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .create_if_missing(true)
-        .foreign_keys(true);
-    options.log_statements(LevelFilter::Debug);
-    options.log_slow_statements(LevelFilter::Info, Duration::from_secs(60));
-
-    let pool: SqlitePool = PoolOptions::new()
-        .max_connections(config.max_conn)
-        .min_connections(config.min_conn)
-        .idle_timeout(Duration::from_secs(60))
-        .connect_with(options)
-        .await
-        .unwrap();
-    SqliteRepo::new(pool, metrics)
+async fn build_sqlite_pool(settings: &Settings, metrics: NostrMetrics) -> SqliteRepo {
+    let repo = SqliteRepo::new(settings, metrics);
+    repo.start().await.ok();
+    repo.migrate_up().await.ok();
+    repo
 }
 
 /// Spawn a database writer that persists events to the SQLite store.
@@ -122,8 +132,6 @@ pub async fn db_writer(
     let rps_setting = settings.limits.messages_per_sec;
     let mut most_recent_rate_limit = Instant::now();
     let mut lim_opt = None;
-    // Keep rough track of events so we can run optimize eventually.
-    let mut optimize_counter: usize = 0;
     let clock = governor::clock::QuantaClock::default();
     if let Some(rps) = rps_setting {
         if rps > 0 {
@@ -132,7 +140,6 @@ pub async fn db_writer(
             lim_opt = Some(RateLimiter::direct(Quota::per_minute(quota)));
         }
     }
-
     loop {
         if shutdown.try_recv().is_ok() {
             info!("shutting down database writer");
@@ -155,14 +162,33 @@ pub async fn db_writer(
             // TODO: incorporate delegated pubkeys
             // if the event address is not in allowed_addrs.
             if !allowed_addrs.contains(&event.pubkey) {
-                info!(
-                    "Rejecting event {}, unauthorized author",
+                debug!(
+                    "rejecting event: {}, unauthorized author",
                     event.get_event_id_prefix()
                 );
                 notice_tx
                     .try_send(Notice::blocked(
                         event.id,
                         "pubkey is not allowed to publish to this relay",
+                    ))
+                    .ok();
+                continue;
+            }
+        }
+
+        // Check that event kind isn't blacklisted
+        let kinds_blacklist = &settings.limits.event_kind_blacklist.clone();
+        if let Some(event_kind_blacklist) = kinds_blacklist {
+            if event_kind_blacklist.contains(&event.kind) {
+                debug!(
+                    "rejecting event: {}, blacklisted kind: {}",
+                    &event.get_event_id_prefix(),
+                    &event.kind
+                );
+                notice_tx
+                    .try_send(Notice::blocked(
+                        event.id,
+                        "event kind is blocked by relay"
                     ))
                     .ok();
                 continue;
@@ -189,10 +215,11 @@ pub async fn db_writer(
                             event.get_author_prefix()
                         );
                     } else {
-                        info!("rejecting event, author ({:?} / {:?}) verification invalid (expired/wrong domain)",
-                                  uv.name.to_string(),
-                                  event.get_author_prefix()
-                            );
+                        info!(
+                            "rejecting event, author ({:?} / {:?}) verification invalid (expired/wrong domain)",
+                            uv.name.to_string(),
+                            event.get_author_prefix()
+                        );
                         notice_tx
                             .try_send(Notice::blocked(
                                 event.id,
@@ -202,7 +229,7 @@ pub async fn db_writer(
                         continue;
                     }
                 }
-                Err(_RowNotFound) => {
+                Err(Error::SqlError(rusqlite::Error::QueryReturnedNoRows)) => {
                     debug!(
                         "no verification records found for pubkey: {:?}",
                         event.get_author_prefix()
@@ -221,18 +248,17 @@ pub async fn db_writer(
                 }
             }
         }
-
         // TODO: cache recent list of authors to remove a DB call.
         let start = Instant::now();
-        if event.kind >= 20000 && event.kind < 30000 {
+        if event.is_ephemeral() {
             bcast_tx.send(event.clone()).ok();
-            info!(
+            debug!(
                 "published ephemeral event: {:?} from: {:?} in: {:?}",
                 event.get_event_id_prefix(),
                 event.get_author_prefix(),
                 start.elapsed()
             );
-            event_write = true
+            event_write = true;
         } else {
             match repo.write_event(&event).await {
                 Ok(updated) => {
@@ -241,10 +267,12 @@ pub async fn db_writer(
                         notice_tx.try_send(Notice::duplicate(event.id)).ok();
                     } else {
                         info!(
-                            "persisted event: {:?} from: {:?} in: {:?}",
+                            "persisted event: {:?} (kind: {}) from: {:?} in: {:?} (IP: {:?})",
                             event.get_event_id_prefix(),
+                            event.kind,
                             event.get_author_prefix(),
-                            start.elapsed()
+                            start.elapsed(),
+                            subm_event.source_ip,
                         );
                         event_write = true;
                         // send this out to all clients
@@ -258,13 +286,6 @@ pub async fn db_writer(
                     notice_tx.try_send(Notice::error(event.id, msg)).ok();
                 }
             }
-            // Use this as a trigger to do optimization
-            optimize_counter += 1;
-            if optimize_counter > EVENT_COUNT_OPTIMIZE_TRIGGER {
-                info!("running database optimizer");
-                optimize_counter = 0;
-                repo.optimize_db().await?;
-            }
         }
 
         // use rate limit, if defined, and if an event was actually written.
@@ -277,9 +298,9 @@ pub async fn db_writer(
                     // per second.
                     if most_recent_rate_limit.elapsed().as_secs() > 10 {
                         warn!(
-                                "rate limit reached for event creation (sleep for {:?}) (suppressing future messages for 10 seconds)",
-                                wait_for
-                            );
+                            "rate limit reached for event creation (sleep for {:?}) (suppressing future messages for 10 seconds)",
+                            wait_for
+                        );
                         // reset last rate limit message
                         most_recent_rate_limit = Instant::now();
                     }
