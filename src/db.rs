@@ -2,33 +2,21 @@
 //use crate::config::SETTINGS;
 use crate::config::Settings;
 use crate::error::{Error, Result};
-use crate::event::{single_char_tagname, Event};
-use crate::hexrange::hex_range;
-use crate::hexrange::HexSearch;
-use crate::nip05;
+use crate::event::Event;
 use crate::notice::Notice;
-use crate::schema::{upgrade_db, STARTUP_SQL};
-use crate::subscription::ReqFilter;
-use crate::subscription::Subscription;
-use crate::utils::{is_hex, is_lower_hex};
+use crate::repo::postgres::{PostgresPool, PostgresRepo};
+use crate::repo::sqlite::SqliteRepo;
+use crate::repo::NostrRepo;
+use crate::server::NostrMetrics;
 use governor::clock::Clock;
 use governor::{Quota, RateLimiter};
-use hex;
 use r2d2;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::params;
-use rusqlite::types::ToSql;
-use rusqlite::OpenFlags;
-use std::fmt::Write as _;
-use std::path::Path;
-use std::thread;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
-use crate::repo::sqlite::SqliteRepo;
-use crate::repo::postgres::{PostgresRepo,PostgresPool};
-use crate::repo::NostrRepo;
-use std::time::{Instant, Duration};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 use tracing::log::LevelFilter;
 use tracing::{debug, info, trace, warn};
 
@@ -59,8 +47,8 @@ pub const EVENT_COUNT_BACKUP_PAUSE_TRIGGER: usize = 1000;
 /// Will panic if the pool could not be created.
 pub async fn build_repo(settings: &Settings, metrics: NostrMetrics) -> Arc<dyn NostrRepo> {
     match settings.database.engine.as_str() {
-        "sqlite" => Arc::new(build_sqlite_pool(&settings.database, metrics).await),
-        "postgres" => Arc::new(build_postgres_pool(settings, metrics).await),
+        "sqlite" => Arc::new(build_sqlite_pool(&settings, metrics).await),
+        "postgres" => Arc::new(build_postgres_pool(&settings, metrics).await),
         _ => panic!("Unknown database engine"),
     }
 }
@@ -78,7 +66,7 @@ async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> Postgr
         .await
         .unwrap();
 
-    let write_pool : PostgresPool = match &config.database.connection_write {
+    let write_pool: PostgresPool = match &config.database.connection_write {
         Some(cfg_write) => {
             let mut options_write: PgConnectOptions = cfg_write.as_str().parse().unwrap();
             options_write.log_statements(LevelFilter::Debug);
@@ -91,17 +79,16 @@ async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> Postgr
                 .connect_with(options_write)
                 .await
                 .unwrap()
-        },
-        None => pool.clone()
+        }
+        None => pool.clone(),
     };
 
-    // Panic on migration failure
-    let version = write_pool.migrate_up().await.unwrap();
-    info!("Postgres migration completed, at v{}", version);
+    let repo = PostgresRepo::new(pool, write_pool, metrics);
 
-    PostgresRepo::new(pool, write_pool, metrics, PostgresRepoSettings {
-        cleanup_contact_list: config.options.cleanup_contact_list
-    })
+    // Panic on migration failure
+    let version = repo.migrate_up().await.unwrap();
+    info!("Postgres migration completed, at v{}", version);
+    repo
 }
 
 async fn build_sqlite_pool(settings: &Settings, metrics: NostrMetrics) -> SqliteRepo {
@@ -186,10 +173,7 @@ pub async fn db_writer(
                     &event.kind
                 );
                 notice_tx
-                    .try_send(Notice::blocked(
-                        event.id,
-                        "event kind is blocked by relay"
-                    ))
+                    .try_send(Notice::blocked(event.id, "event kind is blocked by relay"))
                     .ok();
                 continue;
             }

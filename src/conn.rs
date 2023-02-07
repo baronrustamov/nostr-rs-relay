@@ -43,11 +43,11 @@ impl ClientConn {
     pub fn new(client_ip_addr: String, config: &Settings) -> Self {
         let client_id = Uuid::new_v4();
         ClientConn {
-            client_ip_addr,
+            client_ip_addr: client_ip_addr.clone(),
             client_id,
             subscriptions: HashMap::new(),
             max_subs: 32,
-            pub_limiter: if config.limits.rate_limit_whitelist.contains(&client_ip) {
+            pub_limiter: if config.limits.rate_limit_whitelist.contains(&client_ip_addr) {
                 None
             } else {
                 Some(RateLimiter::direct(Quota::per_minute(nonzero!(60_u32))))
@@ -55,12 +55,14 @@ impl ClientConn {
         }
     }
 
-    #[must_use] pub fn subscriptions(&self) -> &HashMap<String, Subscription> {
+    #[must_use]
+    pub fn subscriptions(&self) -> &HashMap<String, Subscription> {
         &self.subscriptions
     }
 
     /// Check if the given subscription already exists
-    #[must_use] pub fn has_subscription(&self, sub: &Subscription) -> bool {
+    #[must_use]
+    pub fn has_subscription(&self, sub: &Subscription) -> bool {
         self.subscriptions.values().any(|x| x == sub)
     }
 

@@ -39,7 +39,7 @@ pub struct Network {
 #[allow(unused)]
 pub struct Options {
     pub reject_future_seconds: Option<usize>, // if defined, reject any events with a timestamp more than X seconds in the future
-    pub cleanup_contact_list: bool, // delete old kind 3 events automatically
+    pub cleanup_contact_list: bool,           // delete old kind 3 events automatically
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +65,7 @@ pub struct Limits {
     pub broadcast_buffer: usize, // events to buffer for subscribers (prevents slow readers from consuming memory)
     pub event_persist_buffer: usize, // events to buffer for database commits (block senders if database writes are too slow)
     pub rate_limit_whitelist: Vec<String>, // List of ip's which bypass event publishing limits
-    pub event_kind_blacklist: Option<Vec<u64>>
+    pub event_kind_blacklist: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,7 +258,7 @@ impl Default for Settings {
             },
             options: Options {
                 reject_future_seconds: None, // Reject events in the future if defined
-                cleanup_contact_list: true
+                cleanup_contact_list: true,
             },
         }
     }
