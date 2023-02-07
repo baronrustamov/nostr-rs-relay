@@ -139,7 +139,7 @@ ON CONFLICT (id) DO NOTHING"#,
                     Some(_) => {
                         // if tag value is lowercase hex;
                         if is_lower_hex(tag_val) && (tag_val.len() % 2 == 0) {
-                            sqlx::query("INSERT INTO tag (event_id, \"name\", value, value_hex) VALUES($1, $2, NULL, $4) \
+                            sqlx::query("INSERT INTO tag (event_id, \"name\", value, value_hex) VALUES($1, $2, NULL, $3) \
                     ON CONFLICT (event_id, \"name\", value, value_hex) DO NOTHING")
                                 .bind(&id_blob)
                                 .bind(tag_name)
