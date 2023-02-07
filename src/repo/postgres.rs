@@ -67,7 +67,7 @@ impl NostrRepo for PostgresRepo {
         // replaceable event or parameterized replaceable event.
         if e.is_replaceable() {
             let repl_count = sqlx::query(
-                "SELECT e.id FROM event e WHERE e.pub_key=? AND e.kind=? AND e.created_at >= ? LIMIT 1;")
+                "SELECT e.id FROM event e WHERE e.pub_key=$1 AND e.kind=$2 AND e.created_at >= $3 LIMIT 1;")
                 .bind(&pubkey_blob)
                 .bind(e.kind as i64)
                 .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
@@ -135,8 +135,8 @@ ON CONFLICT (id) DO NOTHING"#,
                 let tag_val = &tag[1];
                 // only single-char tags are searchable
                 let tag_char_opt = single_char_tagname(tag_name);
-                let query = "INSERT INTO tag (event_id, \"name\", value) VALUES($1, $2, $3) \
-                    ON CONFLICT (event_id, \"name\", value) DO NOTHING";
+                let query = "INSERT INTO tag (event_id, \"name\", value, value_hex) VALUES($1, $2, $3, $4) \
+                    ON CONFLICT (event_id, \"name\", value, value_hex) DO NOTHING";
                 match &tag_char_opt {
                     Some(_) => {
                         // if tag value is lowercase hex;
