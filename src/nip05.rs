@@ -42,8 +42,8 @@ pub struct Verifier {
 /// A NIP-05 identifier is a local part and domain.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct Nip05Name {
-    local: String,
-    domain: String,
+    pub local: String,
+    pub domain: String,
 }
 
 impl Nip05Name {
@@ -261,8 +261,15 @@ impl Verifier {
         // run a loop, restarting on failure
         loop {
             let res = self.run_internal().await;
-            if let Err(e) = res {
+            match res {
+                Err(Error::ChannelClosed) => {
+                    // channel was closed, we are shutting down
+                    return;
+                },
+                Err(e) => {
                 info!("error in verifier: {:?}", e);
+                },
+                _ => {}
             }
         }
     }
@@ -309,6 +316,7 @@ impl Verifier {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         info!("metadata broadcast channel closed");
+                        return Err(Error::ChannelClosed);
                     }
                 }
             },
