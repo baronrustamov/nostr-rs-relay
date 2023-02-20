@@ -2,12 +2,12 @@
 //use crate::config::SETTINGS;
 use crate::config::Settings;
 use crate::db::QueryResult;
-use crate::error::Result;
+use crate::error::{Result,Error::SqlError};
 use crate::event::{single_char_tagname, Event};
 use crate::hexrange::hex_range;
 use crate::hexrange::HexSearch;
+use crate::repo::sqlite_migration::{STARTUP_SQL,upgrade_db};
 use crate::nip05::{Nip05Name, VerificationRecord};
-use crate::repo::sqlite_migration::{upgrade_db, STARTUP_SQL};
 use crate::server::NostrMetrics;
 use crate::subscription::{ReqFilter, Subscription};
 use crate::utils::{is_hex, is_lower_hex};
@@ -125,15 +125,9 @@ impl SqliteRepo {
         }
         // check for parameterized replaceable events that would be hidden; don't insert these either.
         if let Some(d_tag) = e.distinct_param() {
-            let repl_count = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
-                tx.query_row(
-                    "SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.author=? AND e.kind=? AND t.name='d' AND t.value_hex=? AND e.created_at >= ? LIMIT 1;",
-                    params![pubkey_blob, e.kind, hex::decode(d_tag).ok(), e.created_at],|row| row.get::<usize, usize>(0))
-            } else {
-                tx.query_row(
-                    "SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.author=? AND e.kind=? AND t.name='d' AND t.value=? AND e.created_at >= ? LIMIT 1;",
-                    params![pubkey_blob, e.kind, d_tag, e.created_at],|row| row.get::<usize, usize>(0))
-            };
+            let repl_count = tx.query_row(
+                "SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.author=? AND e.kind=? AND t.name='d' AND t.value=? AND e.created_at >= ? LIMIT 1;",
+                params![pubkey_blob, e.kind, d_tag, e.created_at],|row| row.get::<usize, usize>(0));
             // if any rows were returned, then some newer event with
             // the same author/kind/tag value exist, and we can ignore
             // this event.
@@ -143,8 +137,8 @@ impl SqliteRepo {
         }
         // ignore if the event hash is a duplicate.
         let mut ins_count = tx.execute(
-            "INSERT OR IGNORE INTO event (event_hash, created_at, kind, author, delegated_by, content, first_seen, hidden) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'), FALSE);",
-            params![id_blob, e.created_at, e.kind, pubkey_blob, delegator_blob, event_str]
+            "INSERT OR IGNORE INTO event (event_hash, created_at, expires_at, kind, author, delegated_by, content, first_seen, hidden) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'), FALSE);",
+            params![id_blob, e.created_at, e.expiration(), e.kind, pubkey_blob, delegator_blob, event_str]
         )? as u64;
         if ins_count == 0 {
             // if the event was a duplicate, no need to insert event or
@@ -164,18 +158,10 @@ impl SqliteRepo {
                 let tagchar_opt = single_char_tagname(tagname);
                 match &tagchar_opt {
                     Some(_) => {
-                        // if tagvalue is lowercase hex;
-                        if is_lower_hex(tagval) && (tagval.len() % 2 == 0) {
-                            tx.execute(
-                                "INSERT OR IGNORE INTO tag (event_id, name, value_hex) VALUES (?1, ?2, ?3)",
-                                params![ev_id, &tagname, hex::decode(tagval).ok()],
-                            )?;
-                        } else {
-                            tx.execute(
-                                "INSERT OR IGNORE INTO tag (event_id, name, value) VALUES (?1, ?2, ?3)",
-                                params![ev_id, &tagname, &tagval],
-                            )?;
-                        }
+                        tx.execute(
+                            "INSERT OR IGNORE INTO tag (event_id, name, value, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![ev_id, &tagname, &tagval, e.kind, e.created_at],
+                        )?;
                     }
                     None => {}
                 }
@@ -202,15 +188,9 @@ impl SqliteRepo {
         }
         // if this event is parameterized replaceable, remove other events.
         if let Some(d_tag) = e.distinct_param() {
-            let update_count = if is_lower_hex(&d_tag) && (d_tag.len() % 2 == 0) {
-                tx.execute(
-                    "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=? AND e.author=? AND t.name='d' AND t.value_hex=? ORDER BY created_at DESC LIMIT -1 OFFSET 1);",
-                    params![e.kind, pubkey_blob, e.kind, pubkey_blob, hex::decode(d_tag).ok()])?
-            } else {
-                tx.execute(
-                    "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=? AND e.author=? AND t.name='d' AND t.value=? ORDER BY created_at DESC LIMIT -1 OFFSET 1);",
-                    params![e.kind, pubkey_blob, e.kind, pubkey_blob, d_tag])?
-            };
+            let update_count = tx.execute(
+                "DELETE FROM event WHERE kind=? AND author=? AND id IN (SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.kind=? AND e.author=? AND t.name='d' AND t.value=? ORDER BY t.created_at DESC LIMIT -1 OFFSET 1);",
+                params![e.kind, pubkey_blob, e.kind, pubkey_blob, d_tag])?;
             if update_count > 0 {
                 info!(
                     "removed {} older parameterized replaceable kind {} events for author: {:?}",
@@ -245,8 +225,8 @@ impl SqliteRepo {
             // check if a deletion has already been recorded for this event.
             // Only relevant for non-deletion events
             let del_count = tx.query_row(
-                "SELECT e.id FROM event e LEFT JOIN tag t ON e.id=t.event_id WHERE e.author=? AND t.name='e' AND e.kind=5 AND t.value_hex=? LIMIT 1;",
-                params![pubkey_blob, id_blob], |row| row.get::<usize, usize>(0));
+                "SELECT e.id FROM event e WHERE e.author=? AND e.id IN (SELECT t.event_id FROM tag t WHERE t.name='e' AND t.kind=5 AND t.value=?) LIMIT 1;",
+                params![pubkey_blob, e.id], |row| row.get::<usize, usize>(0));
             // check if a the query returned a result, meaning we should
             // hid the current event
             if del_count.ok().is_some() {
@@ -277,7 +257,8 @@ impl NostrRepo for SqliteRepo {
             Duration::from_secs(60),
             self.checkpoint_in_progress.clone(),
         )
-        .await
+        .await?;
+        cleanup_expired(self.maint_pool.clone(), Duration::from_secs(600), self.write_in_progress.clone()).await
     }
 
     async fn migrate_up(&self) -> Result<usize> {
@@ -288,6 +269,8 @@ impl NostrRepo for SqliteRepo {
     /// Persist event to database
     async fn write_event(&self, e: &Event) -> Result<u64> {
         let start = Instant::now();
+        let max_write_attempts = 10;
+        let mut attempts = 0;
         let _write_guard = self.write_in_progress.lock().await;
         // spawn a blocking thread
         //let mut conn = self.write_pool.get()?;
@@ -295,7 +278,26 @@ impl NostrRepo for SqliteRepo {
         let e = e.clone();
         let event_count = task::spawn_blocking(move || {
             let mut conn = pool.get()?;
-            SqliteRepo::persist_event(&mut conn, &e)
+            // this could fail because the database was busy; try
+            // multiple times before giving up.
+            loop {
+                attempts+=1;
+                let wr = SqliteRepo::persist_event(&mut conn, &e);
+                match wr {
+                    Err(SqlError(rusqlite::Error::SqliteFailure(e,_))) => {
+                        // this basically means that NIP-05 or another
+                        // writer was using the database between us
+                        // reading and promoting the connection to a
+                        // write lock.
+                        info!("event write failed, DB locked (attempt: {}); sqlite err: {}",
+                        attempts, e.extended_code);
+                    },
+                    _ => {return wr;},
+                }
+                if attempts >= max_write_attempts {
+                    return wr;
+                }
+            }
         })
         .await?;
         self.metrics
@@ -377,7 +379,7 @@ impl NostrRepo for SqliteRepo {
                 for filter in sub.filters.iter() {
                     let filter_start = Instant::now();
                     filter_count += 1;
-                    let sql_gen_elapsed = start.elapsed();
+                    let sql_gen_elapsed = filter_start.elapsed();
                     let (q, p, idx) = query_from_filter(filter);
                     if sql_gen_elapsed > Duration::from_millis(10) {
                         debug!("SQL (slow) generated in {:?}", filter_start.elapsed());
@@ -843,58 +845,44 @@ fn query_from_filter(f: &ReqFilter) -> (String, Vec<Box<dyn ToSql>>, Option<Stri
     if let Some(map) = &f.tags {
         for (key, val) in map.iter() {
             let mut str_vals: Vec<Box<dyn ToSql>> = vec![];
-            let mut blob_vals: Vec<Box<dyn ToSql>> = vec![];
             for v in val {
-                if (v.len() % 2 == 0) && is_lower_hex(v) {
-                    if let Ok(h) = hex::decode(v) {
-                        blob_vals.push(Box::new(h));
-                    }
-                } else {
-                    str_vals.push(Box::new(v.clone()));
-                }
+                str_vals.push(Box::new(v.clone()));
             }
-            // do not mix value and value_hex; this is a temporary special case.
-            if str_vals.is_empty() {
-                // create clauses with "?" params for each tag value being searched
-                let blob_clause = format!("value_hex IN ({})", repeat_vars(blob_vals.len()));
-                // find evidence of the target tag name/value existing for this event.
-                let tag_clause = format!(
-                    "e.id IN (SELECT t.event_id FROM tag t WHERE (name=? AND {blob_clause}))",
-                );
-                // add the tag name as the first parameter
-                params.push(Box::new(key.to_string()));
-                // add all tag values that are blobs as params
-                params.append(&mut blob_vals);
-                filter_components.push(tag_clause);
-            } else if blob_vals.is_empty() {
-                // create clauses with "?" params for each tag value being searched
-                let str_clause = format!("value IN ({})", repeat_vars(str_vals.len()));
-                // find evidence of the target tag name/value existing for this event.
-                let tag_clause = format!(
-                    "e.id IN (SELECT t.event_id FROM tag t WHERE (name=? AND {str_clause}))",
-                );
-                // add the tag name as the first parameter
-                params.push(Box::new(key.to_string()));
-                // add all tag values that are blobs as params
-                params.append(&mut str_vals);
-                filter_components.push(tag_clause);
+            // create clauses with "?" params for each tag value being searched
+            let str_clause = format!("AND value IN ({})", repeat_vars(str_vals.len()));
+            // find evidence of the target tag name/value existing for this event.
+            // Query for Kind/Since/Until additionally, to reduce the number of tags that come back.
+            let kind_clause;
+            let since_clause;
+            let until_clause;
+            if let Some(ks) = &f.kinds {
+                // kind is number, no escaping needed
+                let str_kinds: Vec<String> = ks.iter().map(std::string::ToString::to_string).collect();
+                kind_clause = format!("AND kind IN ({})", str_kinds.join(", "));
             } else {
-                debug!("mixed string/blob query");
-                // create clauses with "?" params for each tag value being searched
-                let str_clause = format!("value IN ({})", repeat_vars(str_vals.len()));
-                let blob_clause = format!("value_hex IN ({})", repeat_vars(blob_vals.len()));
-                // find evidence of the target tag name/value existing for this event.
-                let tag_clause = format!(
-		            "e.id IN (SELECT t.event_id FROM tag t WHERE (name=? AND ({str_clause} OR {blob_clause})))",
-                );
-                // add the tag name as the first parameter
-                params.push(Box::new(key.to_string()));
-                // add all tag values that are plain strings as params
-                params.append(&mut str_vals);
-                // add all tag values that are blobs as params
-                params.append(&mut blob_vals);
-                filter_components.push(tag_clause);
-            }
+                kind_clause = format!("");
+                    };
+            if f.since.is_some() {
+                since_clause = format!("AND created_at > {}", f.since.unwrap());
+            } else {
+                since_clause = format!("");
+            };
+            // Query for timestamp
+            if f.until.is_some() {
+                until_clause = format!("AND created_at < {}", f.until.unwrap());
+            } else {
+                until_clause = format!("");
+            };
+
+            let tag_clause = format!(
+		"e.id IN (SELECT t.event_id FROM tag t WHERE (name=? {str_clause} {kind_clause} {since_clause} {until_clause}))"
+            );
+
+            // add the tag name as the first parameter
+            params.push(Box::new(key.to_string()));
+            // add all tag values that are blobs as params
+            params.append(&mut str_vals);
+            filter_components.push(tag_clause);
         }
     }
     // Query for timestamp
@@ -909,6 +897,9 @@ fn query_from_filter(f: &ReqFilter) -> (String, Vec<Box<dyn ToSql>>, Option<Stri
     }
     // never display hidden events
     query.push_str(" WHERE hidden!=TRUE");
+    // never display hidden events
+    filter_components.push("(expires_at IS NULL OR expires_at > ?)".to_string());
+    params.push(Box::new(unix_time()));
     // build filter component conditions
     if !filter_components.is_empty() {
         query.push_str(" AND ");
@@ -996,6 +987,54 @@ pub fn build_pool(
         name, min_size, max_size
     );
     pool
+}
+
+/// Cleanup expired events on a regular basis
+async fn cleanup_expired(pool: SqlitePool, frequency: Duration, write_in_progress: Arc<Mutex<u64>>) -> Result<()> {
+    tokio::task::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(frequency) => {
+                    if let Ok(mut conn) = pool.get() {
+                        let mut _guard:Option<MutexGuard<u64>> = None;
+                        // take a write lock to prevent event writes
+                        // from proceeding while we are deleting
+                        // events.  This isn't necessary, but
+                        // minimizes the chances of forcing event
+                        // persistence to be retried.
+                        _guard = Some(write_in_progress.lock().await);
+                        let start = Instant::now();
+                        let exp_res = tokio::task::spawn_blocking(move || {
+                            delete_expired(&mut conn)
+                        }).await;
+                        match exp_res {
+                            Ok(Ok(count)) => {
+                                if count > 0 {
+                                    info!("removed {} expired events in: {:?}", count, start.elapsed());
+                                }
+                            },
+                            _ => {
+                                // either the task or underlying query failed
+                                info!("there was an error cleaning up expired events: {:?}", exp_res);
+                            }
+                        }
+                    }
+                }
+            };
+        }
+    });
+    Ok(())
+}
+
+/// Execute a query to delete all expired events
+pub fn delete_expired(conn: &mut PooledConnection) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let update_count = tx.execute(
+        "DELETE FROM event WHERE expires_at <= ?",
+        params![unix_time()],
+    )?;
+    tx.commit()?;
+    Ok(update_count)
 }
 
 /// Perform database WAL checkpoint on a regular basis

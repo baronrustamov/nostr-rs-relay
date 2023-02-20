@@ -16,6 +16,10 @@ description = "A newly created nostr-rs-relay.\n\nCustomize this with your own i
 # Administrative contact URI
 #contact = "mailto:contact@example.com"
 
+# Favicon location.  Relative to the current directory.  Assumes an
+# ICO format.
+#favicon = "favicon.ico"
+
 [diagnostics]
 # Enable tokio tracing (for use with tokio-console)
 #tracing = true
@@ -57,7 +61,7 @@ data_directory = "."
 # the URL below.  In the event the server is not accessible, events
 # will be permitted.  The protobuf3 schema used is available in
 # `proto/nauthz.proto`.
-# event_authorization_server = "http://[::1]:50051"
+# event_admission_server = "http://[::1]:50051"
 
 [network]
 # Bind to this network address
@@ -143,6 +147,8 @@ cleanup_contact_list = true
 #  "35d26e4690cbe1a898af61cc3515661eb5fa763b57bd0b42e45099c8b32fd50f",
 #  "887645fef0ce0c3c1218d2f5d8e6132a19304cdc57cd20281d082f38cfea0072",
 #]
+# Enable NIP-42 authentication
+#nip42_auth = false
 
 [verified_users]
 # NIP-05 verification of users.  Can be "enabled" to require NIP-05

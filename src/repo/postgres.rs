@@ -16,11 +16,11 @@ use crate::error;
 use crate::hexrange::{hex_range, HexSearch};
 use crate::repo::postgres_migration::run_migrations;
 use crate::server::NostrMetrics;
-use crate::utils::{is_hex, is_lower_hex};
+use crate::utils::{is_hex, is_lower_hex, self};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Receiver;
 use tracing::log::trace;
-use tracing::{debug, error, info};
+use tracing::{debug, error, warn, info};
 
 pub type PostgresPool = sqlx::pool::Pool<Postgres>;
 
@@ -38,12 +38,51 @@ impl PostgresRepo {
             metrics: m,
         }
     }
+
+}
+
+
+/// Cleanup expired events on a regular basis
+async fn cleanup_expired(conn: PostgresPool, frequency: Duration) -> Result<()> {
+    tokio::task::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(frequency) => {
+                    let start = Instant::now();
+                    let exp_res = delete_expired(conn.clone()).await;
+                    match exp_res {
+                        Ok(exp_count) => {
+                            if exp_count > 0 {
+                                info!("removed {} expired events in: {:?}", exp_count, start.elapsed());
+                            }
+                        },
+                        Err(e) => {
+                            warn!("could not remove expired events due to error: {:?}", e);
+                        }
+                    }
+                }
+            };
+        }
+    });
+    Ok(())
+}
+
+/// One-time deletion of all expired events
+async fn delete_expired(conn:PostgresPool) -> Result<u64> {
+    let mut tx = conn.begin().await?;
+    let update_count = sqlx::query("DELETE FROM \"event\" WHERE expires_at <= $1;")
+        .bind(Utc.timestamp_opt(utils::unix_time() as i64, 0).unwrap())
+        .execute(&mut tx)
+        .await?.rows_affected();
+    tx.commit().await?;
+    Ok(update_count)
 }
 
 #[async_trait]
 impl NostrRepo for PostgresRepo {
     async fn start(&self) -> Result<()> {
-        info!("not implemented");
+        // begin a cleanup task for expired events.
+        cleanup_expired(self.conn.clone(), Duration::from_secs(600)).await?;
         Ok(())
     }
 
@@ -107,14 +146,15 @@ impl NostrRepo for PostgresRepo {
         // ignore if the event hash is a duplicate.
         let mut ins_count = sqlx::query(
             r#"INSERT INTO "event"
-(id, pub_key, created_at, kind, "content", delegated_by)
-VALUES($1, $2, $3, $4, $5, $6)
+(id, pub_key, created_at, expires_at, kind, "content", delegated_by)
+VALUES($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (id) DO NOTHING"#,
         )
         .bind(&id_blob)
         .bind(&pubkey_blob)
         .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-        .bind(e.kind as i64)
+        .bind(e.expiration().and_then(|x| Utc.timestamp_opt(x as i64, 0).latest()))
+            .bind(e.kind as i64)
         .bind(event_str.into_bytes())
         .bind(delegator_blob)
         .execute(&mut tx)
@@ -515,6 +555,7 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
 
     let mut query = QueryBuilder::new("SELECT e.\"content\", e.created_at FROM \"event\" e WHERE ");
 
+    // This tracks whether we need to push a prefix AND before adding another clause
     let mut push_and = false;
     // Query for "authors", allowing prefix matches
     if let Some(auth_vec) = &f.authors {
@@ -720,6 +761,10 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
     } else {
         query.push("e.hidden != 1::bit(1)");
     }
+    // never display expired events
+    query
+        .push(" AND (e.expires_at IS NULL OR e.expires_at > ")
+        .push_bind(Utc.timestamp_opt(utils::unix_time() as i64, 0).unwrap()).push(")");
 
     // Apply per-filter limit to this query.
     // The use of a LIMIT implies a DESC order, to capture only the most recent events.

@@ -31,20 +31,13 @@ pub struct SubmittedEvent {
     pub source_ip: String,
     pub origin: Option<String>,
     pub user_agent: Option<String>,
+    pub auth_pubkey: Option<Vec<u8>>,
 }
 
 /// Database file
 pub const DB_FILE: &str = "nostr.db";
 
-/// How frequently to run maintenance
-/// How many persisted events before DB maintenannce is triggered.
-pub const EVENT_MAINTENANCE_FREQ_SEC: u64 = 60;
-
-/// How many persisted events before we pause for backups.
-/// It isn't clear this is enough to make the online backup API work yet.
-pub const EVENT_COUNT_BACKUP_PAUSE_TRIGGER: usize = 1000;
-
-/// Build a database connection pool.
+/// Build repo
 /// # Panics
 ///
 /// Will panic if the pool could not be created.
@@ -56,14 +49,14 @@ pub async fn build_repo(settings: &Settings, metrics: NostrMetrics) -> Arc<dyn N
     }
 }
 
-async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> PostgresRepo {
-    let mut options: PgConnectOptions = config.database.connection.as_str().parse().unwrap();
+async fn build_postgres_pool(settings: &Settings, metrics: NostrMetrics) -> PostgresRepo {
+    let mut options: PgConnectOptions = settings.database.connection.as_str().parse().unwrap();
     options.log_statements(LevelFilter::Debug);
     options.log_slow_statements(LevelFilter::Warn, Duration::from_secs(60));
 
     let pool: PostgresPool = PoolOptions::new()
-        .max_connections(config.database.max_conn)
-        .min_connections(config.database.min_conn)
+        .max_connections(settings.database.max_conn)
+        .min_connections(settings.database.min_conn)
         .idle_timeout(Duration::from_secs(60))
         .connect_with(options)
         .await
@@ -91,6 +84,8 @@ async fn build_postgres_pool(config: &Settings, metrics: NostrMetrics) -> Postgr
     // Panic on migration failure
     let version = repo.migrate_up().await.unwrap();
     info!("Postgres migration completed, at v{}", version);
+    // startup scheduled tasks
+    repo.start().await.ok();
     repo
 }
 
@@ -210,7 +205,6 @@ pub async fn db_writer(
             None
         };
 
-
         // check for  NIP-05 verification
         if nip05_enabled && validation.is_some() {
             match validation.as_ref().unwrap() {
@@ -264,7 +258,7 @@ pub async fn db_writer(
         if let Some(ref mut c) = grpc_client {
             trace!("checking if grpc permits");
             let grpc_start = Instant::now();
-            let decision_res = c.admit_event(&event, &subm_event.source_ip, subm_event.origin, subm_event.user_agent, nip05_address).await;
+            let decision_res = c.admit_event(&event, &subm_event.source_ip, subm_event.origin, subm_event.user_agent, nip05_address, subm_event.auth_pubkey).await;
             match decision_res {
                 Ok(decision) => {
                     if !decision.permitted() {

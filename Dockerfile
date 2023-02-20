@@ -22,7 +22,7 @@ RUN rm ./target/release/deps/nostr*relay*
 RUN cargo auditable build --release --locked
 RUN cargo test
 
-FROM docker.io/library/debian:bullseye-slim
+FROM docker.io/library/debian:bookworm-slim
 
 ARG APP=/usr/src/app
 ARG APP_DATA=/usr/src/app/db
