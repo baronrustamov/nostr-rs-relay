@@ -79,7 +79,7 @@ pub struct Limits {
 #[allow(unused)]
 pub struct Authorization {
     pub pubkey_whitelist: Option<Vec<String>>, // If present, only allow these pubkeys to publish events
-    pub nip42_auth: bool, // if true enables NIP-42 authentication
+    pub nip42_auth: bool,                      // if true enables NIP-42 authentication
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,18 +180,20 @@ impl Settings {
         }
     }
 
-
-    fn new_from_default(default: &Settings, config_file_name: &Option<String>) -> Result<Self, ConfigError> {
+    fn new_from_default(
+        default: &Settings,
+        config_file_name: &Option<String>,
+    ) -> Result<Self, ConfigError> {
         let default_config_file_name = "config.toml".to_string();
         let config: &String = match config_file_name {
             Some(value) => value,
-            None => &default_config_file_name
+            None => &default_config_file_name,
         };
         let builder = Config::builder();
         let config: Config = builder
-        // use defaults
+            // use defaults
             .add_source(Config::try_from(default)?)
-        // override with file contents
+            // override with file contents
             .add_source(File::with_name(config))
             .build()?;
         let mut settings: Settings = config.try_deserialize()?;
@@ -258,7 +260,7 @@ impl Default for Settings {
             },
             authorization: Authorization {
                 pubkey_whitelist: None, // Allow any address to publish
-                nip42_auth: false, // Disable NIP-42 authentication
+                nip42_auth: false,      // Disable NIP-42 authentication
             },
             verified_users: VerifiedUsers {
                 mode: VerifiedUsersMode::Disabled,

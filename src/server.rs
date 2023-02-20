@@ -6,14 +6,15 @@ use crate::conn;
 use crate::db;
 use crate::db::SubmittedEvent;
 use crate::error::{Error, Result};
-use crate::event::EventWrapper;
-use crate::server::EventWrapper::{WrappedAuth, WrappedEvent};
 use crate::event::Event;
 use crate::event::EventCmd;
+use crate::event::EventWrapper;
 use crate::info::RelayInfo;
 use crate::nip05;
 use crate::notice::Notice;
 use crate::repo::NostrRepo;
+use crate::server::Error::CommandUnknownError;
+use crate::server::EventWrapper::{WrappedAuth, WrappedEvent};
 use crate::subscription::Subscription;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -53,7 +54,6 @@ use tungstenite::error::Error as WsError;
 use tungstenite::handshake;
 use tungstenite::protocol::Message;
 use tungstenite::protocol::WebSocketConfig;
-use crate::server::Error::CommandUnknownError;
 
 /// Handle arbitrary HTTP requests, including for `WebSocket` upgrades.
 #[allow(clippy::too_many_arguments)]
@@ -197,17 +197,17 @@ async fn handle_web_request(
             if let Some(favicon_bytes) = favicon {
                 info!("returning favicon");
                 Ok(Response::builder()
-                   .status(StatusCode::OK)
-                   .header("Content-Type", "image/x-icon")
-                   // 1 month cache
-                   .header("Cache-Control", "public, max-age=2419200")
-                   .body(Body::from(favicon_bytes))
-                   .unwrap())
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "image/x-icon")
+                    // 1 month cache
+                    .header("Cache-Control", "public, max-age=2419200")
+                    .body(Body::from(favicon_bytes))
+                    .unwrap())
             } else {
                 Ok(Response::builder()
-                   .status(StatusCode::NOT_FOUND)
-                   .body(Body::from(""))
-                   .unwrap())
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(""))
+                    .unwrap())
             }
         }
         (_, _) => {
@@ -290,10 +290,8 @@ fn create_metrics() -> (Registry, NostrMetrics) {
         IntCounter::with_opts(Opts::new("nostr_cmd_event_total", "EVENT commands")).unwrap();
     let cmd_close =
         IntCounter::with_opts(Opts::new("nostr_cmd_close_total", "CLOSE commands")).unwrap();
-    let cmd_auth = IntCounter::with_opts(Opts::new(
-        "nostr_cmd_auth_total",
-        "AUTH commands",
-    )).unwrap();
+    let cmd_auth =
+        IntCounter::with_opts(Opts::new("nostr_cmd_auth_total", "AUTH commands")).unwrap();
     let disconnects = IntCounterVec::new(
         Opts::new("nostr_disconnects_total", "Client disconnects"),
         vec!["reason"].as_slice(),
@@ -662,9 +660,7 @@ async fn nostr_server(
     let unspec = "<unspecified>".to_string();
     info!("new client connection (cid: {}, ip: {:?})", cid, conn.ip());
     let origin = client_info.origin.as_ref().unwrap_or_else(|| &unspec);
-    let user_agent = client_info
-        .user_agent.as_ref()
-        .unwrap_or_else(|| &unspec);
+    let user_agent = client_info.user_agent.as_ref().unwrap_or_else(|| &unspec);
     info!(
         "cid: {}, origin: {:?}, user-agent: {:?}",
         cid, origin, user_agent
@@ -676,8 +672,12 @@ async fn nostr_server(
     if settings.authorization.nip42_auth {
         conn.generate_auth_challenge();
         if let Some(challenge) = conn.auth_challenge() {
-            ws_stream.send(
-                make_notice_message(&Notice::AuthChallenge(challenge.to_string()))).await.ok();
+            ws_stream
+                .send(make_notice_message(&Notice::AuthChallenge(
+                    challenge.to_string(),
+                )))
+                .await
+                .ok();
         }
     }
 
@@ -796,7 +796,7 @@ async fn nostr_server(
                         // handle each type of message
                         let evid = ec.event_id().to_owned();
                         let parsed : Result<EventWrapper> = Result::<EventWrapper>::from(ec);
-                        
+
                         match parsed {
                             Ok(WrappedEvent(e)) => {
                                 metrics.cmd_event.inc();
@@ -964,5 +964,6 @@ pub struct NostrMetrics {
     pub query_aborts: IntCounterVec, // count of queries aborted by server
     pub cmd_req: IntCounter,         // count of REQ commands received
     pub cmd_event: IntCounter,       // count of EVENT commands received
-    pub cmd_close: IntCounter,       // count of CLOSE commands receivedpub cmd_auth: IntCounter, // count of AUTH commands received
+    pub cmd_close: IntCounter, // count of CLOSE commands receivedpub cmd_auth: IntCounter, // count of AUTH commands received
+    pub cmd_auth: IntCounter,
 }

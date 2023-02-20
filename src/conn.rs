@@ -1,5 +1,6 @@
 //! Client connection state
 use crate::close::Close;
+use crate::config::Settings;
 use crate::conn::Nip42AuthState::{AuthPubkey, Challenge, NoAuth};
 use crate::error::Error;
 use crate::error::Result;
@@ -171,12 +172,12 @@ impl ClientConn {
             Challenge(_) => (),
             AuthPubkey(_) => {
                 // already authenticated
-                return Ok(())
-            },
+                return Ok(());
+            }
             NoAuth => {
                 // unexpected AUTH request
                 return Err(Error::AuthFailure);
-            },
+            }
         }
         match event.validate() {
             Ok(_) => {

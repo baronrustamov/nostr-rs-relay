@@ -16,11 +16,11 @@ use crate::error;
 use crate::hexrange::{hex_range, HexSearch};
 use crate::repo::postgres_migration::run_migrations;
 use crate::server::NostrMetrics;
-use crate::utils::{is_hex, is_lower_hex, self};
+use crate::utils::{self, is_hex, is_lower_hex};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Receiver;
 use tracing::log::trace;
-use tracing::{debug, error, warn, info};
+use tracing::{debug, error, info, warn};
 
 pub type PostgresPool = sqlx::pool::Pool<Postgres>;
 
@@ -38,9 +38,7 @@ impl PostgresRepo {
             metrics: m,
         }
     }
-
 }
-
 
 /// Cleanup expired events on a regular basis
 async fn cleanup_expired(conn: PostgresPool, frequency: Duration) -> Result<()> {
@@ -68,12 +66,13 @@ async fn cleanup_expired(conn: PostgresPool, frequency: Duration) -> Result<()> 
 }
 
 /// One-time deletion of all expired events
-async fn delete_expired(conn:PostgresPool) -> Result<u64> {
+async fn delete_expired(conn: PostgresPool) -> Result<u64> {
     let mut tx = conn.begin().await?;
     let update_count = sqlx::query("DELETE FROM \"event\" WHERE expires_at <= $1;")
         .bind(Utc.timestamp_opt(utils::unix_time() as i64, 0).unwrap())
         .execute(&mut tx)
-        .await?.rows_affected();
+        .await?
+        .rows_affected();
     tx.commit().await?;
     Ok(update_count)
 }
@@ -153,8 +152,11 @@ ON CONFLICT (id) DO NOTHING"#,
         .bind(&id_blob)
         .bind(&pubkey_blob)
         .bind(Utc.timestamp_opt(e.created_at as i64, 0).unwrap())
-        .bind(e.expiration().and_then(|x| Utc.timestamp_opt(x as i64, 0).latest()))
-            .bind(e.kind as i64)
+        .bind(
+            e.expiration()
+                .and_then(|x| Utc.timestamp_opt(x as i64, 0).latest()),
+        )
+        .bind(e.kind as i64)
         .bind(event_str.into_bytes())
         .bind(delegator_blob)
         .execute(&mut tx)
@@ -764,7 +766,8 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
     // never display expired events
     query
         .push(" AND (e.expires_at IS NULL OR e.expires_at > ")
-        .push_bind(Utc.timestamp_opt(utils::unix_time() as i64, 0).unwrap()).push(")");
+        .push_bind(Utc.timestamp_opt(utils::unix_time() as i64, 0).unwrap())
+        .push(")");
 
     // Apply per-filter limit to this query.
     // The use of a LIMIT implies a DESC order, to capture only the most recent events.

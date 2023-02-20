@@ -14,7 +14,7 @@ pub struct CLIArgs {
         short,
         long,
         help = "Use the <file name> as the location of the config file",
-        required = false,
+        required = false
     )]
     pub config: Option<String>,
 }
