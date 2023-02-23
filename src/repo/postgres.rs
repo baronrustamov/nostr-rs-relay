@@ -81,7 +81,7 @@ async fn delete_expired(conn: PostgresPool) -> Result<u64> {
 impl NostrRepo for PostgresRepo {
     async fn start(&self) -> Result<()> {
         // begin a cleanup task for expired events.
-        cleanup_expired(self.conn.clone(), Duration::from_secs(600)).await?;
+        cleanup_expired(self.conn_write.clone(), Duration::from_secs(600)).await?;
         Ok(())
     }
 
