@@ -602,11 +602,6 @@ async fn nostr_server(
     mut shutdown: Receiver<()>,
     metrics: NostrMetrics,
 ) {
-    // reject unspecified origin
-    if client_info.origin.is_none() {
-        return;
-    }
-
     // the time this websocket nostr server started
     let orig_start = Instant::now();
     // get a broadcast channel for clients to communicate on
