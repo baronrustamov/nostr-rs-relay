@@ -715,6 +715,10 @@ fn query_from_filter(f: &ReqFilter) -> Option<QueryBuilder<Postgres>> {
             push_and = true;
 
             for (key, val) in map.iter() {
+                if val.len() > 256 {
+                    // abort query if too many tag search
+                    return None
+                }
                 query.push("e.id IN (SELECT ee.id FROM \"event\" ee LEFT JOIN tag t on ee.id = t.event_id WHERE ee.hidden != 1::bit(1) and (t.\"name\" = ")
                     .push_bind(key.to_string())
                     .push(" AND (value in (");
