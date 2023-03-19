@@ -2,7 +2,7 @@
 
 [info]
 # The advertised URL for the Nostr websocket.
-relay_url = "wss://semaphore.life/"
+relay_url = "wss://relay.semaphore.life/"
 
 # Relay information for clients.  Put your unique server name here.
 name = "semaphore.life nostr relay"
