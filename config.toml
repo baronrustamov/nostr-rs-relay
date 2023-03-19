@@ -18,7 +18,7 @@ contact = "mailto:shapiroimse@gmail.com"
 
 # Favicon location.  Relative to the current directory.  Assumes an
 # ICO format.
-#favicon = "favicon.ico"
+favicon = "favicon.ico"
 
 [diagnostics]
 # Enable tokio tracing (for use with tokio-console)
